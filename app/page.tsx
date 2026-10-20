@@ -5,507 +5,455 @@ import {
   useMemo,
   useRef,
   useState,
-  type KeyboardEvent as ReactKeyboardEvent,
+  type ChangeEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
 
+type Mode = "plan" | "layout" | "networks" | "budget" | "products";
+type Layer = "existing" | "lining";
 type NetworkKind = "electric" | "cold" | "hot";
-type PanelTab = "element" | "catalog" | "networks" | "budget" | "saves";
-type ItemGroup = "Meubles" | "Équipements" | "Ouvertures" | "Réseaux";
-type ItemKind =
-  | "base" | "column" | "shelf" | "table" | "fridge" | "oven" | "hob" | "sink"
-  | "dishwasher" | "hood" | "door" | "window" | "chimney" | "outlet" | "light"
-  | "water-outlet-cold" | "water-outlet-hot" | "source-electric" | "source-cold" | "source-hot";
+type Point = { x: number; y: number };
+type SelectedWall = { layer: Layer; index: number };
 
-type PlanItem = {
+type FixtureKind = "door" | "window" | "outlet" | "switch" | "light" | "water-cold" | "water-hot" | "source-electric" | "source-cold" | "source-hot";
+type WallFixture = {
   id: string;
-  kind: ItemKind;
+  kind: FixtureKind;
   name: string;
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  openingHeight?: number;
+  layer: Layer;
+  wallIndex: number;
+  offset: number;
+  width: number;
+  height: number;
+  mountHeight: number;
+  quantity: number;
 };
 
-type RoomSettings = { width: number; depth: number; height: number };
-type BuildSettings = { studSpacing: number; studLength: number; waste: number; tileWaste: number; includeCeiling: boolean };
-type RoutePoint = { x: number; y: number };
-type NetworkRoute = {
+type ObjectKind = "cabinet" | "tall" | "worktop" | "appliance" | "sanitary" | "table" | "radiator" | "custom";
+type PlanObject = { id: string; kind: ObjectKind; name: string; x: number; y: number; w: number; h: number };
+type NetworkRoute = { id: string; kind: NetworkKind; name: string; points: Point[]; sourceFixtureId?: string; targetFixtureId?: string };
+
+type ProductCategory = "plomberie" | "electricite" | "ossature" | "isolation" | "plaques" | "carrelage" | "consommables";
+type Product = {
   id: string;
-  kind: NetworkKind;
   name: string;
-  points: RoutePoint[];
-  sourceId?: string;
-  targetId?: string;
-  autoLinked?: boolean;
+  reference: string;
+  category: ProductCategory;
+  store: string;
+  url: string;
+  price: number;
+  coverage: number;
+  coverageUnit: string;
+  packLabel: string;
+  checkedAt: string;
 };
-type NetworkVisibility = Record<NetworkKind, boolean>;
 
-type PriceKey =
-  | "perColdM" | "perHotM" | "perFitting" | "perElbow" | "waterOutlet"
-  | "cable15M" | "cable25M" | "cable6M" | "socket" | "socketBox" | "breaker" | "light"
-  | "rail3M" | "stud" | "insulationM2" | "ba13Sheet" | "screwsBox"
-  | "tileM2" | "adhesiveBag" | "groutBag";
-type PriceCatalog = Record<PriceKey, number>;
-
-type SavedConfiguration = {
+type MaterialLine = { key: string; category: ProductCategory; label: string; required: number; unit: string; detail: string };
+type BudgetChoice = { productId?: string; manualQuantity?: number };
+type BuildSettings = { roomHeight: number; liningDepth: number; studSpacing: number; waste: number; tileWaste: number; includeCeiling: boolean };
+type SavedProject = {
   id: string;
   name: string;
   updatedAt: string;
-  items: PlanItem[];
-  networks: NetworkVisibility;
-  routes?: NetworkRoute[];
-  room?: RoomSettings;
-  prices?: PriceCatalog;
-  build?: BuildSettings;
+  existing: Point[];
+  lining: Point[];
+  fixtures: WallFixture[];
+  objects: PlanObject[];
+  routes: NetworkRoute[];
+  build: BuildSettings;
+  budgetChoices: Record<string, BudgetChoice>;
 };
 
-type ItemSpec = {
-  label: string;
-  short: string;
-  group: ItemGroup;
-  defaultW: number;
-  defaultH: number;
-  color: string;
-  electric?: { protection: string; section: "1,5 mm²" | "2,5 mm²" | "6 mm²" };
-  water?: { cold?: boolean; hot?: boolean; drain?: boolean };
-  source?: NetworkKind;
-};
+type DragState =
+  | { type: "wall-point"; layer: Layer; index: number }
+  | { type: "fixture"; id: string }
+  | { type: "object"; id: string; start: Point; origin: Point }
+  | { type: "resize-object"; id: string; start: Point; origin: Point }
+  | { type: "route-point"; routeId: string; pointIndex: number; start: Point; origin: Point };
 
-type ItemGesture = { id: string; mode: "move" | "resize"; startX: number; startY: number; originX: number; originY: number; originW: number; originH: number };
-type RouteGesture = { routeId: string; pointIndex: number; startX: number; startY: number; originX: number; originY: number };
-type MaterialLine = { category: "Plomberie" | "Électricité" | "Cloisons" | "Carrelage"; label: string; detail: string; qty: number; unit: string; priceKey: PriceKey };
-
-const DRAFT_KEY = "emmanuel-kitchen-editor-draft-v2";
-const SAVES_KEY = "emmanuel-kitchen-editor-saves-v2";
-const defaultRoom: RoomSettings = { width: 530, depth: 500, height: 250 };
-const defaultBuild: BuildSettings = { studSpacing: 60, studLength: 260, waste: 10, tileWaste: 10, includeCeiling: false };
-const defaultNetworks: NetworkVisibility = { electric: true, cold: true, hot: true };
-const defaultPrices: PriceCatalog = {
-  perColdM: 0.95, perHotM: 0.95, perFitting: 3.5, perElbow: 2.5, waterOutlet: 8,
-  cable15M: 0.75, cable25M: 1.35, cable6M: 3.8, socket: 8.5, socketBox: 2.2, breaker: 15, light: 6,
-  rail3M: 5.5, stud: 6.5, insulationM2: 9, ba13Sheet: 12.5, screwsBox: 7,
-  tileM2: 25, adhesiveBag: 22, groutBag: 15,
-};
-
-const specs: Record<ItemKind, ItemSpec> = {
-  base: { label: "Meuble bas", short: "Meuble", group: "Meubles", defaultW: 60, defaultH: 60, color: "#c8744f" },
-  column: { label: "Colonne de rangement", short: "Colonne", group: "Meubles", defaultW: 60, defaultH: 60, color: "#28433f" },
-  shelf: { label: "Meuble coulissant", short: "Étagère", group: "Meubles", defaultW: 180, defaultH: 60, color: "#87907d" },
-  table: { label: "Table / îlot libre", short: "Table", group: "Meubles", defaultW: 140, defaultH: 80, color: "#dfa95a" },
-  fridge: { label: "Réfrigérateur", short: "Frigo", group: "Équipements", defaultW: 60, defaultH: 60, color: "#345c56", electric: { protection: "16 A dédié conseillé", section: "2,5 mm²" } },
-  oven: { label: "Four", short: "Four", group: "Équipements", defaultW: 60, defaultH: 60, color: "#345c56", electric: { protection: "20 A", section: "2,5 mm²" } },
-  hob: { label: "Plaque de cuisson", short: "Plaque", group: "Équipements", defaultW: 60, defaultH: 60, color: "#36504d", electric: { protection: "32 A", section: "6 mm²" } },
-  sink: { label: "Évier", short: "Évier", group: "Équipements", defaultW: 90, defaultH: 60, color: "#4e8993", water: { cold: true, hot: true, drain: true } },
-  dishwasher: { label: "Lave-vaisselle", short: "LV", group: "Équipements", defaultW: 60, defaultH: 60, color: "#4e8993", electric: { protection: "20 A", section: "2,5 mm²" }, water: { cold: true, drain: true } },
-  hood: { label: "Hotte", short: "Hotte", group: "Équipements", defaultW: 60, defaultH: 35, color: "#64736f", electric: { protection: "16 A", section: "1,5 mm²" } },
-  door: { label: "Porte", short: "Porte", group: "Ouvertures", defaultW: 90, defaultH: 12, color: "#8b8173" },
-  window: { label: "Fenêtre", short: "Fenêtre", group: "Ouvertures", defaultW: 120, defaultH: 12, color: "#4f8b95" },
-  chimney: { label: "Cheminée / obstacle", short: "Cheminée", group: "Ouvertures", defaultW: 180, defaultH: 50, color: "#a69c8c" },
-  outlet: { label: "Prise électrique", short: "Prise", group: "Réseaux", defaultW: 24, defaultH: 24, color: "#d49635", electric: { protection: "Circuit prises", section: "2,5 mm²" } },
-  light: { label: "Point lumineux", short: "Lumière", group: "Réseaux", defaultW: 24, defaultH: 24, color: "#e5b552", electric: { protection: "10 / 16 A", section: "1,5 mm²" } },
-  "water-outlet-cold": { label: "Sortie eau froide libre", short: "Sortie EF", group: "Réseaux", defaultW: 24, defaultH: 24, color: "#2684c7", water: { cold: true } },
-  "water-outlet-hot": { label: "Sortie eau chaude libre", short: "Sortie EC", group: "Réseaux", defaultW: 24, defaultH: 24, color: "#d35c45", water: { hot: true } },
-  "source-electric": { label: "Tableau électrique", short: "Élec.", group: "Réseaux", defaultW: 26, defaultH: 26, color: "#d49635", source: "electric" },
-  "source-cold": { label: "Arrivée eau froide", short: "EF", group: "Réseaux", defaultW: 26, defaultH: 26, color: "#2684c7", source: "cold" },
-  "source-hot": { label: "Départ eau chaude", short: "EC", group: "Réseaux", defaultW: 26, defaultH: 26, color: "#d35c45", source: "hot" },
-};
-
-const defaultItems: PlanItem[] = [
-  { id: "pantry", kind: "column", name: "Garde-manger", x: 0, y: 0, w: 60, h: 60 },
-  { id: "oven", kind: "oven", name: "Colonne four", x: 60, y: 0, w: 60, h: 60 },
-  { id: "fridge", kind: "fridge", name: "Réfrigérateur", x: 120, y: 0, w: 60, h: 60 },
-  { id: "pullout", kind: "base", name: "Coulissant", x: 380, y: 0, w: 30, h: 60 },
-  { id: "hob", kind: "hob", name: "Plaque", x: 410, y: 0, w: 60, h: 60 },
-  { id: "corner", kind: "base", name: "Angle", x: 470, y: 0, w: 60, h: 60 },
-  { id: "sink", kind: "sink", name: "Évier", x: 470, y: 60, w: 60, h: 90 },
-  { id: "prep", kind: "base", name: "Préparation", x: 230, y: 180, w: 120, h: 75 },
-  { id: "sorting", kind: "base", name: "Tri", x: 350, y: 180, w: 60, h: 75 },
-  { id: "dishwasher", kind: "dishwasher", name: "Lave-vaisselle", x: 410, y: 180, w: 60, h: 75 },
-  { id: "fixed-shelf", kind: "shelf", name: "Meuble coulissant prévu", x: 160, y: 440, w: 370, h: 60 },
-  { id: "chimney", kind: "chimney", name: "Cheminée condamnée", x: 200, y: 0, w: 180, h: 50 },
-  { id: "salon-door", kind: "door", name: "Double porte salon", x: 30, y: 488, w: 130, h: 12, openingHeight: 215 },
-  { id: "entry-door", kind: "door", name: "Porte d’entrée", x: 518, y: 300, w: 12, h: 120, openingHeight: 215 },
-  { id: "street-window", kind: "window", name: "Grande fenêtre", x: 0, y: 300, w: 12, h: 100, openingHeight: 110 },
-  { id: "high-window", kind: "window", name: "Fenêtre haute", x: 518, y: 90, w: 12, h: 110, openingHeight: 60 },
-  { id: "source-electric", kind: "source-electric", name: "Tableau électrique", x: 493, y: 382, w: 26, h: 26 },
-  { id: "source-cold", kind: "source-cold", name: "Arrivée eau froide", x: 392, y: 8, w: 26, h: 26 },
-  { id: "source-hot", kind: "source-hot", name: "Départ eau chaude", x: 424, y: 8, w: 26, h: 26 },
-];
-
-const groups: ItemGroup[] = ["Meubles", "Équipements", "Ouvertures", "Réseaux"];
-const catalogGroups = groups.map((group) => ({ group, kinds: (Object.keys(specs) as ItemKind[]).filter((kind) => specs[kind].group === group) }));
+const DRAFT_KEY = "atelier-renovation-draft-v1";
+const PRODUCTS_KEY = "atelier-renovation-products-v1";
+const SAVES_KEY = "atelier-renovation-saves-v1";
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
-const copyItems = (items: PlanItem[]) => items.map((item) => ({ ...item }));
-const copyRoutes = (routes: NetworkRoute[]) => routes.map((route) => ({ ...route, points: route.points.map((point) => ({ ...point })) }));
-const centerOf = (item: PlanItem) => ({ x: item.x + item.w / 2, y: item.y + item.h / 2 });
-const networkLabel = (kind: NetworkKind) => kind === "electric" ? "Électricité" : kind === "cold" ? "Eau froide" : "Eau chaude";
+const round = (value: number, digits = 1) => Math.round(value * 10 ** digits) / 10 ** digits;
+const formatDate = (value: string) => {
+  const [year, month, day] = value.split("-");
+  return year && month && day ? `${day}/${month}/${year}` : value;
+};
+const copyPoints = (points: Point[]) => points.map((point) => ({ ...point }));
+const copyFixtures = (fixtures: WallFixture[]) => fixtures.map((fixture) => ({ ...fixture }));
+const copyObjects = (objects: PlanObject[]) => objects.map((object) => ({ ...object }));
+const copyRoutes = (routes: NetworkRoute[]) => routes.map((route) => ({ ...route, points: copyPoints(route.points) }));
 
-function isValidItems(value: unknown): value is PlanItem[] {
-  return Array.isArray(value) && value.every((item) => {
-    if (!item || typeof item !== "object") return false;
-    const candidate = item as Partial<PlanItem>;
-    return typeof candidate.id === "string" && typeof candidate.name === "string" && typeof candidate.kind === "string" && candidate.kind in specs && [candidate.x, candidate.y, candidate.w, candidate.h].every(Number.isFinite);
+const defaultExisting: Point[] = [
+  { x: 0, y: 0 }, { x: 200, y: 0 }, { x: 200, y: 50 }, { x: 380, y: 50 },
+  { x: 380, y: 0 }, { x: 530, y: 0 }, { x: 530, y: 500 }, { x: 0, y: 500 },
+];
+
+const defaultBuild: BuildSettings = { roomHeight: 250, liningDepth: 8, studSpacing: 60, waste: 10, tileWaste: 10, includeCeiling: false };
+
+const fixtureMeta: Record<FixtureKind, { label: string; short: string; color: string; network?: NetworkKind; source?: NetworkKind; opening?: boolean }> = {
+  door: { label: "Porte", short: "P", color: "#64748b", opening: true },
+  window: { label: "Fenêtre", short: "F", color: "#06b6d4", opening: true },
+  outlet: { label: "Prise électrique", short: "○", color: "#f59e0b", network: "electric" },
+  switch: { label: "Interrupteur", short: "I", color: "#fbbf24", network: "electric" },
+  light: { label: "Point lumineux", short: "✦", color: "#facc15", network: "electric" },
+  "water-cold": { label: "Sortie eau froide", short: "EF", color: "#0ea5e9", network: "cold" },
+  "water-hot": { label: "Sortie eau chaude", short: "EC", color: "#ef4444", network: "hot" },
+  "source-electric": { label: "Tableau électrique", short: "T", color: "#d97706", source: "electric" },
+  "source-cold": { label: "Arrivée eau froide", short: "EF", color: "#0284c7", source: "cold" },
+  "source-hot": { label: "Départ eau chaude", short: "EC", color: "#dc2626", source: "hot" },
+};
+
+const objectMeta: Record<ObjectKind, { label: string; w: number; h: number; color: string }> = {
+  cabinet: { label: "Meuble bas", w: 60, h: 60, color: "#64748b" },
+  tall: { label: "Colonne", w: 60, h: 60, color: "#475569" },
+  worktop: { label: "Plan de travail", w: 180, h: 65, color: "#0f766e" },
+  appliance: { label: "Électroménager", w: 60, h: 60, color: "#334155" },
+  sanitary: { label: "Équipement sanitaire", w: 90, h: 60, color: "#0891b2" },
+  table: { label: "Table / îlot", w: 160, h: 80, color: "#7c3aed" },
+  radiator: { label: "Radiateur", w: 100, h: 18, color: "#ef4444" },
+  custom: { label: "Volume libre", w: 100, h: 60, color: "#2563eb" },
+};
+
+const defaultObjects: PlanObject[] = [
+  { id: "cabinet-a", kind: "tall", name: "Rangements", x: 15, y: 72, w: 60, h: 60 },
+  { id: "cabinet-b", kind: "worktop", name: "Linéaire principal", x: 90, y: 72, w: 190, h: 65 },
+  { id: "island", kind: "table", name: "Îlot / table", x: 230, y: 230, w: 170, h: 85 },
+];
+
+const defaultFixtures: WallFixture[] = [
+  { id: "door-salon", kind: "door", name: "Double porte", layer: "existing", wallIndex: 6, offset: 0.82, width: 130, height: 215, mountHeight: 0, quantity: 1 },
+  { id: "door-entry", kind: "door", name: "Porte d’entrée", layer: "existing", wallIndex: 5, offset: 0.72, width: 90, height: 215, mountHeight: 0, quantity: 1 },
+  { id: "window-street", kind: "window", name: "Grande fenêtre", layer: "existing", wallIndex: 7, offset: 0.3, width: 100, height: 110, mountHeight: 90, quantity: 1 },
+  { id: "window-high", kind: "window", name: "Fenêtre haute", layer: "existing", wallIndex: 5, offset: 0.29, width: 110, height: 60, mountHeight: 140, quantity: 1 },
+  { id: "elec-source", kind: "source-electric", name: "Tableau électrique", layer: "lining", wallIndex: 5, offset: 0.78, width: 20, height: 40, mountHeight: 110, quantity: 1 },
+  { id: "cold-source", kind: "source-cold", name: "Arrivée d’eau", layer: "lining", wallIndex: 4, offset: 0.72, width: 10, height: 10, mountHeight: 20, quantity: 1 },
+  { id: "hot-source", kind: "source-hot", name: "Départ eau chaude", layer: "lining", wallIndex: 4, offset: 0.86, width: 10, height: 10, mountHeight: 20, quantity: 1 },
+  { id: "outlet-a", kind: "outlet", name: "Prises plan de travail", layer: "lining", wallIndex: 4, offset: 0.42, width: 8, height: 8, mountHeight: 110, quantity: 3 },
+  { id: "water-a", kind: "water-cold", name: "Sortie eau froide", layer: "lining", wallIndex: 5, offset: 0.28, width: 8, height: 8, mountHeight: 55, quantity: 1 },
+  { id: "water-b", kind: "water-hot", name: "Sortie eau chaude", layer: "lining", wallIndex: 5, offset: 0.32, width: 8, height: 8, mountHeight: 55, quantity: 1 },
+];
+
+const defaultProducts: Product[] = [
+  { id: "prod-per-cold", name: "Couronne PER 16 – 25 m", reference: "EX-PER16-25", category: "plomberie", store: "Exemple", url: "", price: 22.9, coverage: 25, coverageUnit: "m", packLabel: "couronne", checkedAt: "2026-08-16" },
+  { id: "prod-per-hot", name: "Couronne PER gainée – 25 m", reference: "EX-PERG-25", category: "plomberie", store: "Exemple", url: "", price: 29.9, coverage: 25, coverageUnit: "m", packLabel: "couronne", checkedAt: "2026-08-16" },
+  { id: "prod-cable-15", name: "Câble 1,5 mm² – 100 m", reference: "EX-C15-100", category: "electricite", store: "Exemple", url: "", price: 54.9, coverage: 100, coverageUnit: "m", packLabel: "couronne", checkedAt: "2026-08-16" },
+  { id: "prod-cable-25", name: "Câble 2,5 mm² – 100 m", reference: "EX-C25-100", category: "electricite", store: "Exemple", url: "", price: 79.9, coverage: 100, coverageUnit: "m", packLabel: "couronne", checkedAt: "2026-08-16" },
+  { id: "prod-sockets", name: "Lot de 3 prises complètes", reference: "EX-PRISE-3", category: "electricite", store: "Exemple", url: "", price: 22, coverage: 3, coverageUnit: "u", packLabel: "lot", checkedAt: "2026-08-16" },
+  { id: "prod-rail", name: "Rail métallique 3 m", reference: "EX-RAIL-3", category: "ossature", store: "Exemple", url: "", price: 5.5, coverage: 3, coverageUnit: "m", packLabel: "barre", checkedAt: "2026-08-16" },
+  { id: "prod-stud", name: "Montant métallique 2,60 m", reference: "EX-MONT-260", category: "ossature", store: "Exemple", url: "", price: 6.5, coverage: 1, coverageUnit: "u", packLabel: "montant", checkedAt: "2026-08-16" },
+  { id: "prod-insulation", name: "Panneaux isolants – paquet 5,76 m²", reference: "EX-ISO-576", category: "isolation", store: "Exemple", url: "", price: 55, coverage: 5.76, coverageUnit: "m²", packLabel: "paquet", checkedAt: "2026-08-16" },
+  { id: "prod-ba13", name: "Plaque BA13 120 × 250", reference: "EX-BA13", category: "plaques", store: "Exemple", url: "", price: 12.5, coverage: 3, coverageUnit: "m²", packLabel: "plaque", checkedAt: "2026-08-16" },
+  { id: "prod-tile", name: "Carrelage – carton 1,44 m²", reference: "EX-CAR-144", category: "carrelage", store: "Exemple", url: "", price: 28.8, coverage: 1.44, coverageUnit: "m²", packLabel: "carton", checkedAt: "2026-08-16" },
+  { id: "prod-adhesive", name: "Colle carrelage – sac 25 kg", reference: "EX-COLLE-25", category: "consommables", store: "Exemple", url: "", price: 22, coverage: 5, coverageUnit: "m²", packLabel: "sac", checkedAt: "2026-08-16" },
+];
+
+const preferredProductByMaterial: Record<string, string> = {
+  "per-cold": "prod-per-cold",
+  "per-hot": "prod-per-hot",
+  "cable-15": "prod-cable-15",
+  "cable-25": "prod-cable-25",
+  sockets: "prod-sockets",
+  rails: "prod-rail",
+  studs: "prod-stud",
+  insulation: "prod-insulation",
+  ba13: "prod-ba13",
+  tiles: "prod-tile",
+  "tile-adhesive": "prod-adhesive",
+};
+
+function signedArea(points: Point[]) {
+  return points.reduce((sum, point, index) => { const next = points[(index + 1) % points.length]; return sum + point.x * next.y - next.x * point.y; }, 0) / 2;
+}
+function polygonArea(points: Point[]) { return Math.abs(signedArea(points)) / 10000; }
+function perimeter(points: Point[]) { return points.reduce((sum, point, index) => { const next = points[(index + 1) % points.length]; return sum + Math.hypot(next.x - point.x, next.y - point.y); }, 0) / 100; }
+function segment(points: Point[], index: number) { return { a: points[index % points.length], b: points[(index + 1) % points.length] }; }
+function segmentLength(points: Point[], index: number) { const { a, b } = segment(points, index); return Math.hypot(b.x - a.x, b.y - a.y); }
+function segmentAngle(points: Point[], index: number) { const { a, b } = segment(points, index); return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI; }
+function pointOnSegment(points: Point[], index: number, offset: number) { const { a, b } = segment(points, index); return { x: a.x + (b.x - a.x) * offset, y: a.y + (b.y - a.y) * offset }; }
+
+function offsetPolygon(points: Point[], distance: number) {
+  const orientation = signedArea(points) >= 0 ? 1 : -1;
+  const normal = (a: Point, b: Point) => { const dx = b.x - a.x; const dy = b.y - a.y; const length = Math.hypot(dx, dy) || 1; return { x: -dy / length * orientation, y: dx / length * orientation }; };
+  const lineIntersection = (p: Point, r: Point, q: Point, s: Point) => {
+    const cross = r.x * s.y - r.y * s.x;
+    if (Math.abs(cross) < 0.0001) return null;
+    const qp = { x: q.x - p.x, y: q.y - p.y };
+    const t = (qp.x * s.y - qp.y * s.x) / cross;
+    return { x: p.x + t * r.x, y: p.y + t * r.y };
+  };
+  return points.map((current, index) => {
+    const previous = points[(index - 1 + points.length) % points.length]; const next = points[(index + 1) % points.length];
+    const n1 = normal(previous, current); const n2 = normal(current, next);
+    const p1 = { x: current.x + n1.x * distance, y: current.y + n1.y * distance };
+    const p2 = { x: current.x + n2.x * distance, y: current.y + n2.y * distance };
+    return lineIntersection(p1, { x: current.x - previous.x, y: current.y - previous.y }, p2, { x: next.x - current.x, y: next.y - current.y }) ?? { x: current.x + (n1.x + n2.x) / 2 * distance, y: current.y + (n1.y + n2.y) / 2 * distance };
   });
 }
 
-function networksNeeded(item: PlanItem): NetworkKind[] {
-  const spec = specs[item.kind];
-  return [spec.electric ? "electric" : null, spec.water?.cold ? "cold" : null, spec.water?.hot ? "hot" : null].filter(Boolean) as NetworkKind[];
-}
-
-function nearestSource(items: PlanItem[], kind: NetworkKind, target: PlanItem) {
-  const end = centerOf(target);
-  return items.filter((item) => specs[item.kind].source === kind).sort((a, b) => {
-    const pa = centerOf(a); const pb = centerOf(b);
-    return (Math.abs(pa.x - end.x) + Math.abs(pa.y - end.y)) - (Math.abs(pb.x - end.x) + Math.abs(pb.y - end.y));
-  })[0];
-}
-
-function linkedRoutesForItem(items: PlanItem[], item: PlanItem, prefix = "auto"): NetworkRoute[] {
-  return networksNeeded(item).flatMap((kind) => {
-    const source = nearestSource(items, kind, item);
-    if (!source) return [];
-    const start = centerOf(source); const end = centerOf(item);
-    return [{ id: `${prefix}-${kind}-${item.id}`, kind, name: `${networkLabel(kind)} · ${item.name}`, sourceId: source.id, targetId: item.id, autoLinked: true, points: [start, { x: start.x, y: end.y }, end] }];
+function fixtureNetwork(kind: FixtureKind) { return fixtureMeta[kind].network; }
+function fixtureSource(kind: FixtureKind) { return fixtureMeta[kind].source; }
+function fixturePosition(fixture: WallFixture, existing: Point[], lining: Point[]) { const points = fixture.layer === "existing" ? existing : lining; return pointOnSegment(points, Math.min(fixture.wallIndex, points.length - 1), fixture.offset); }
+function networkName(kind: NetworkKind) { return kind === "electric" ? "Électricité" : kind === "cold" ? "Eau froide" : "Eau chaude"; }
+function automaticRoutes(fixtures: WallFixture[], existing: Point[], lining: Point[]) {
+  return fixtures.flatMap((target) => {
+    const kind = fixtureNetwork(target.kind); if (!kind) return [];
+    const source = fixtures.find((fixture) => fixtureSource(fixture.kind) === kind); if (!source) return [];
+    const start = fixturePosition(source, existing, lining); const end = fixturePosition(target, existing, lining);
+    return [{ id: `auto-${kind}-${target.id}`, kind, name: `${networkName(kind)} · ${target.name}`, sourceFixtureId: source.id, targetFixtureId: target.id, points: [start, { x: start.x, y: end.y }, end] } as NetworkRoute];
   });
 }
-
-function automaticRoutes(items: PlanItem[]) {
-  return items.flatMap((item) => linkedRoutesForItem(items, item));
-}
-
-function effectivePoints(route: NetworkRoute, items: PlanItem[]) {
-  const points = route.points.map((point) => ({ ...point }));
-  const source = items.find((item) => item.id === route.sourceId);
-  const target = items.find((item) => item.id === route.targetId);
-  if (source && points.length) points[0] = centerOf(source);
-  if (target && points.length) points[points.length - 1] = centerOf(target);
+function effectiveRoutePoints(route: NetworkRoute, fixtures: WallFixture[], existing: Point[], lining: Point[]) {
+  const points = copyPoints(route.points); const source = fixtures.find((fixture) => fixture.id === route.sourceFixtureId); const target = fixtures.find((fixture) => fixture.id === route.targetFixtureId);
+  if (source && points.length) points[0] = fixturePosition(source, existing, lining);
+  if (target && points.length) points[points.length - 1] = fixturePosition(target, existing, lining);
   return points;
 }
-
-function routeLength(route: NetworkRoute, items: PlanItem[]) {
-  const points = effectivePoints(route, items);
-  return points.slice(1).reduce((total, point, index) => total + Math.hypot(point.x - points[index].x, point.y - points[index].y), 0) / 100 * 1.15;
+function routeLength(route: NetworkRoute, fixtures: WallFixture[], existing: Point[], lining: Point[]) {
+  const points = effectiveRoutePoints(route, fixtures, existing, lining);
+  return points.slice(1).reduce((sum, point, index) => sum + Math.hypot(point.x - points[index].x, point.y - points[index].y), 0) / 100 * 1.15;
 }
 
-function NumberField({ label, value, min, max, unit = "cm", onChange }: { label: string; value: number; min: number; max: number; unit?: string; onChange: (value: number) => void }) {
-  return <label className="number-field"><span>{label}</span><div><input type="number" value={Math.round(value * 100) / 100} min={min} max={max} step={unit === "€" ? 0.1 : 5} onChange={(event) => { const next = event.currentTarget.valueAsNumber; if (Number.isFinite(next)) onChange(next); }} /><small>{unit}</small></div></label>;
+function NumberInput({ label, value, unit = "cm", min = 0, max = 9999, step = 1, onChange }: { label: string; value: number; unit?: string; min?: number; max?: number; step?: number; onChange: (value: number) => void }) {
+  return <label className="number-input"><span>{label}</span><div><input type="number" min={min} max={max} step={step} value={round(value, 2)} onChange={(event) => { const next = event.currentTarget.valueAsNumber; if (Number.isFinite(next)) onChange(next); }} /><small>{unit}</small></div></label>;
 }
 
 export default function Home() {
   const svgRef = useRef<SVGSVGElement>(null);
-  const itemGesture = useRef<ItemGesture | null>(null);
-  const routeGesture = useRef<RouteGesture | null>(null);
-  const [room, setRoom] = useState<RoomSettings>(defaultRoom);
+  const dragRef = useRef<DragState | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [mode, setMode] = useState<Mode>("plan");
+  const [existing, setExisting] = useState<Point[]>(defaultExisting);
   const [build, setBuild] = useState<BuildSettings>(defaultBuild);
-  const [items, setItems] = useState<PlanItem[]>(defaultItems);
-  const [routes, setRoutes] = useState<NetworkRoute[]>(() => automaticRoutes(defaultItems));
-  const [selectedId, setSelectedId] = useState<string | null>("prep");
+  const [lining, setLining] = useState<Point[]>(() => offsetPolygon(defaultExisting, defaultBuild.liningDepth));
+  const [fixtures, setFixtures] = useState<WallFixture[]>(defaultFixtures);
+  const [objects, setObjects] = useState<PlanObject[]>(defaultObjects);
+  const [routes, setRoutes] = useState<NetworkRoute[]>(() => automaticRoutes(defaultFixtures, defaultExisting, offsetPolygon(defaultExisting, defaultBuild.liningDepth)));
+  const [products, setProducts] = useState<Product[]>(defaultProducts);
+  const [budgetChoices, setBudgetChoices] = useState<Record<string, BudgetChoice>>({});
+  const [selectedWall, setSelectedWall] = useState<SelectedWall | null>({ layer: "existing", index: 0 });
+  const [selectedFixtureId, setSelectedFixtureId] = useState<string | null>(null);
+  const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
-  const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<PanelTab>("element");
-  const [showGrid, setShowGrid] = useState(true);
+  const [networkFilter, setNetworkFilter] = useState<NetworkKind>("electric");
+  const [orthogonalSnap, setOrthogonalSnap] = useState(true);
   const [showDimensions, setShowDimensions] = useState(true);
-  const [snapToGrid, setSnapToGrid] = useState(true);
-  const [networks, setNetworks] = useState<NetworkVisibility>(defaultNetworks);
-  const [prices, setPrices] = useState<PriceCatalog>(defaultPrices);
-  const [savedConfigs, setSavedConfigs] = useState<SavedConfiguration[]>([]);
-  const [configName, setConfigName] = useState("Configuration péninsule");
-  const [currentConfigId, setCurrentConfigId] = useState<string | null>(null);
+  const [projectName, setProjectName] = useState("Projet rénovation");
+  const [savedProjects, setSavedProjects] = useState<SavedProject[]>([]);
+  const [notice, setNotice] = useState("Toutes les modifications sont enregistrées localement");
   const [hydrated, setHydrated] = useState(false);
-  const [notice, setNotice] = useState("Brouillon automatique actif");
+  const [newProduct, setNewProduct] = useState<Omit<Product, "id">>({ name: "", reference: "", category: "consommables", store: "", url: "", price: 0, coverage: 1, coverageUnit: "u", packLabel: "unité", checkedAt: new Date().toISOString().slice(0, 10) });
 
-  const selected = items.find((item) => item.id === selectedId) ?? null;
+  const selectedFixture = fixtures.find((fixture) => fixture.id === selectedFixtureId) ?? null;
+  const selectedObject = objects.find((object) => object.id === selectedObjectId) ?? null;
   const selectedRoute = routes.find((route) => route.id === selectedRouteId) ?? null;
-  const networkTotals = useMemo(() => routes.reduce((totals, route) => ({ ...totals, [route.kind]: totals[route.kind] + routeLength(route, items) }), { electric: 0, cold: 0, hot: 0 } as Record<NetworkKind, number>), [routes, items]);
-  const circuits = useMemo(() => items.filter((item) => Boolean(specs[item.kind].electric)), [items]);
+  const layerPoints = selectedWall?.layer === "lining" ? lining : existing;
 
-  const roomMetrics = useMemo(() => {
-    const floor = room.width * room.depth / 10000;
-    const perimeter = 2 * (room.width + room.depth) / 100;
-    const openings = items.filter((item) => item.kind === "door" || item.kind === "window");
-    const openingArea = openings.reduce((sum, item) => sum + Math.max(item.w, item.h) / 100 * (item.openingHeight ?? (item.kind === "door" ? 215 : 110)) / 100, 0);
-    const wallGross = perimeter * room.height / 100;
-    const wallNet = Math.max(0, wallGross - openingArea);
-    return { floor, perimeter, openingArea, wallGross, wallNet, openings };
-  }, [room, items]);
+  const bounds = useMemo(() => {
+    const all = [...existing, ...lining, ...objects.flatMap((object) => [{ x: object.x, y: object.y }, { x: object.x + object.w, y: object.y + object.h }])];
+    return { maxX: Math.max(600, ...all.map((point) => point.x)) + 50, maxY: Math.max(550, ...all.map((point) => point.y)) + 50 };
+  }, [existing, lining, objects]);
+
+  const routeTotals = useMemo(() => ({
+    electric: routes.filter((route) => route.kind === "electric").reduce((sum, route) => sum + routeLength(route, fixtures, existing, lining), 0),
+    cold: routes.filter((route) => route.kind === "cold").reduce((sum, route) => sum + routeLength(route, fixtures, existing, lining), 0),
+    hot: routes.filter((route) => route.kind === "hot").reduce((sum, route) => sum + routeLength(route, fixtures, existing, lining), 0),
+  }), [routes, fixtures, existing, lining]);
+
+  const metrics = useMemo(() => {
+    const floor = polygonArea(existing); const existingPerimeter = perimeter(existing); const liningPerimeter = perimeter(lining);
+    const openingArea = fixtures.filter((fixture) => fixtureMeta[fixture.kind].opening).reduce((sum, fixture) => sum + fixture.width / 100 * fixture.height / 100, 0);
+    const wallNet = Math.max(0, liningPerimeter * build.roomHeight / 100 - openingArea);
+    return { floor, existingPerimeter, liningPerimeter, openingArea, wallNet };
+  }, [existing, lining, fixtures, build.roomHeight]);
 
   const materials = useMemo<MaterialLine[]>(() => {
-    const len = (kind: NetworkKind) => routes.filter((route) => route.kind === kind).reduce((sum, route) => sum + routeLength(route, items), 0);
-    const waterRoutes = routes.filter((route) => route.kind === "cold" || route.kind === "hot");
-    const cableBySection = { "1,5 mm²": 0, "2,5 mm²": 0, "6 mm²": 0 };
-    routes.filter((route) => route.kind === "electric").forEach((route) => {
-      const target = items.find((item) => item.id === route.targetId);
-      const section = target && specs[target.kind].electric?.section || "2,5 mm²";
-      cableBySection[section] += routeLength(route, items);
-    });
-    const doorsWidth = items.filter((item) => item.kind === "door").reduce((sum, item) => sum + Math.max(item.w, item.h) / 100, 0);
-    const railLinear = Math.max(0, roomMetrics.perimeter * 2 - doorsWidth) * (1 + build.waste / 100);
-    const railUnits = Math.ceil(railLinear / 3);
-    const studCount = Math.ceil(roomMetrics.perimeter / (build.studSpacing / 100)) + roomMetrics.openings.length * 2;
-    const studUnits = studCount * Math.max(1, Math.ceil(room.height / build.studLength));
-    const liningArea = (roomMetrics.wallNet + (build.includeCeiling ? roomMetrics.floor : 0)) * (1 + build.waste / 100);
-    const sheets = Math.ceil(liningArea / 3);
-    const tileArea = roomMetrics.floor * (1 + build.tileWaste / 100);
-    const sockets = items.filter((item) => item.kind === "outlet").length;
-    const lights = items.filter((item) => item.kind === "light").length;
-    const outlets = items.filter((item) => item.kind === "water-outlet-cold" || item.kind === "water-outlet-hot").length;
+    const factor = 1 + build.waste / 100; const tileArea = metrics.floor * (1 + build.tileWaste / 100);
+    const doorWidth = fixtures.filter((fixture) => fixture.kind === "door").reduce((sum, fixture) => sum + fixture.width / 100, 0);
+    const railLength = Math.max(0, metrics.liningPerimeter * 2 - doorWidth) * factor;
+    const studCount = Math.ceil(metrics.liningPerimeter / (build.studSpacing / 100)) + fixtures.filter((fixture) => fixtureMeta[fixture.kind].opening).length * 2;
+    const wallArea = (metrics.wallNet + (build.includeCeiling ? metrics.floor : 0)) * factor;
+    const socketCount = fixtures.filter((fixture) => fixture.kind === "outlet").reduce((sum, fixture) => sum + fixture.quantity, 0);
     return [
-      { category: "Plomberie", label: "Tube PER 16 eau froide", detail: "Longueur des tracés + 15 %", qty: len("cold"), unit: "m", priceKey: "perColdM" },
-      { category: "Plomberie", label: "Tube PER 16 eau chaude", detail: "Longueur des tracés + 15 %", qty: len("hot"), unit: "m", priceKey: "perHotM" },
-      { category: "Plomberie", label: "Raccords PER", detail: "Deux raccords par conduite", qty: waterRoutes.length * 2, unit: "u", priceKey: "perFitting" },
-      { category: "Plomberie", label: "Coudes / raccords d’angle", detail: "Selon les points intermédiaires", qty: waterRoutes.reduce((sum, route) => sum + Math.max(0, route.points.length - 2), 0), unit: "u", priceKey: "perElbow" },
-      { category: "Plomberie", label: "Sorties d’eau libres", detail: "Vers une autre pièce ou attente", qty: outlets, unit: "u", priceKey: "waterOutlet" },
-      { category: "Électricité", label: "Câble 1,5 mm²", detail: "Éclairage et hotte", qty: cableBySection["1,5 mm²"], unit: "m", priceKey: "cable15M" },
-      { category: "Électricité", label: "Câble 2,5 mm²", detail: "Prises et circuits spécialisés", qty: cableBySection["2,5 mm²"], unit: "m", priceKey: "cable25M" },
-      { category: "Électricité", label: "Câble 6 mm²", detail: "Plaque de cuisson", qty: cableBySection["6 mm²"], unit: "m", priceKey: "cable6M" },
-      { category: "Électricité", label: "Prises électriques", detail: "Mécanismes complets", qty: sockets, unit: "u", priceKey: "socket" },
-      { category: "Électricité", label: "Boîtes d’encastrement", detail: "Une par prise", qty: sockets, unit: "u", priceKey: "socketBox" },
-      { category: "Électricité", label: "Disjoncteurs / départs", detail: "Estimation par point ou appareil", qty: circuits.length, unit: "u", priceKey: "breaker" },
-      { category: "Électricité", label: "Points lumineux", detail: "Douille ou sortie DCL", qty: lights, unit: "u", priceKey: "light" },
-      { category: "Cloisons", label: "Rails de 3 m", detail: `${railLinear.toFixed(1)} m linéaires avec marge`, qty: railUnits, unit: "u", priceKey: "rail3M" },
-      { category: "Cloisons", label: `Montants de ${build.studLength} cm`, detail: `Entraxe ${build.studSpacing} cm + renforts ouvertures`, qty: studUnits, unit: "u", priceKey: "stud" },
-      { category: "Cloisons", label: "Isolation", detail: "Surface nette avec marge", qty: liningArea, unit: "m²", priceKey: "insulationM2" },
-      { category: "Cloisons", label: "Plaques BA13 120 × 250", detail: `${liningArea.toFixed(1)} m² à couvrir`, qty: sheets, unit: "u", priceKey: "ba13Sheet" },
-      { category: "Cloisons", label: "Boîtes de vis", detail: "Base 1 000 vis", qty: Math.max(1, Math.ceil(sheets * 30 / 1000)), unit: "u", priceKey: "screwsBox" },
-      { category: "Carrelage", label: "Carrelage", detail: `Sol + ${build.tileWaste} % de marge`, qty: tileArea, unit: "m²", priceKey: "tileM2" },
-      { category: "Carrelage", label: "Colle carrelage", detail: "Rendement estimé 5 m² / sac", qty: Math.ceil(tileArea / 5), unit: "sac", priceKey: "adhesiveBag" },
-      { category: "Carrelage", label: "Joint carrelage", detail: "Rendement estimé 20 m² / sac", qty: Math.max(1, Math.ceil(tileArea / 20)), unit: "sac", priceKey: "groutBag" },
+      { key: "per-cold", category: "plomberie", label: "Tube PER eau froide", required: routeTotals.cold, unit: "m", detail: "Tracés + 15 %" },
+      { key: "per-hot", category: "plomberie", label: "Tube PER eau chaude", required: routeTotals.hot, unit: "m", detail: "Tracés + 15 %" },
+      { key: "cable-15", category: "electricite", label: "Câble 1,5 mm²", required: routeTotals.electric * 0.25, unit: "m", detail: "Part éclairage estimée" },
+      { key: "cable-25", category: "electricite", label: "Câble 2,5 mm²", required: routeTotals.electric * 0.75, unit: "m", detail: "Part prises estimée" },
+      { key: "sockets", category: "electricite", label: "Prises complètes", required: socketCount, unit: "u", detail: "Quantité posée sur les murs" },
+      { key: "rails", category: "ossature", label: "Rails métalliques", required: railLength, unit: "m", detail: "Sol + plafond, portes déduites" },
+      { key: "studs", category: "ossature", label: "Montants métalliques", required: studCount, unit: "u", detail: `Entraxe ${build.studSpacing} cm + renforts` },
+      { key: "insulation", category: "isolation", label: "Isolation", required: wallArea, unit: "m²", detail: "Murs nets avec marge" },
+      { key: "ba13", category: "plaques", label: "Plaques de plâtre", required: wallArea, unit: "m²", detail: "Surface nette avec marge" },
+      { key: "tiles", category: "carrelage", label: "Revêtement de sol", required: tileArea, unit: "m²", detail: `Sol + ${build.tileWaste} %` },
+      { key: "tile-adhesive", category: "consommables", label: "Colle carrelage", required: tileArea, unit: "m²", detail: "Couverture à prévoir" },
     ];
-  }, [routes, items, room, build, roomMetrics]);
+  }, [metrics, routeTotals, fixtures, build]);
 
-  const categoryTotals = useMemo(() => materials.reduce((totals, line) => ({ ...totals, [line.category]: (totals[line.category] ?? 0) + line.qty * prices[line.priceKey] }), {} as Record<string, number>), [materials, prices]);
-  const grandTotal = Object.values(categoryTotals).reduce((sum, value) => sum + value, 0);
-
-  const collisions = useMemo(() => {
-    const solids = items.filter((item) => !specs[item.kind].source && !["outlet", "light", "door", "window", "water-outlet-cold", "water-outlet-hot"].includes(item.kind));
-    let count = 0;
-    for (let i = 0; i < solids.length; i += 1) for (let j = i + 1; j < solids.length; j += 1) {
-      const a = solids[i]; const b = solids[j];
-      if (a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y) count += 1;
-    }
-    return count;
-  }, [items]);
+  const resolvedBudget = useMemo(() => materials.map((line) => {
+    const compatibles = products.filter((product) => product.category === line.category && product.coverageUnit === line.unit);
+    const choice = budgetChoices[line.key] ?? {};
+    const selectedProduct = products.find((entry) => entry.id === choice.productId);
+    const preferredProduct = compatibles.find((entry) => entry.id === preferredProductByMaterial[line.key]);
+    const product = selectedProduct ?? preferredProduct ?? compatibles[0] ?? null;
+    const automaticQuantity = product ? Math.max(0, Math.ceil(line.required / Math.max(product.coverage, 0.0001))) : 0;
+    const quantity = choice.manualQuantity ?? automaticQuantity;
+    return { ...line, compatibles, product, automaticQuantity, quantity, purchased: product ? quantity * product.coverage : 0, remainder: product ? quantity * product.coverage - line.required : 0, total: product ? quantity * product.price : 0 };
+  }), [materials, products, budgetChoices]);
+  const grandTotal = resolvedBudget.reduce((sum, line) => sum + line.total, 0);
 
   useEffect(() => {
     try {
-      const draft = JSON.parse(window.localStorage.getItem(DRAFT_KEY) ?? "null");
-      if (draft && isValidItems(draft.items)) {
-        const legacyInfrastructure = draft.items.some((item: PlanItem) => item.kind === "door" || item.kind === "window" || item.kind === "chimney")
-          ? []
-          : defaultItems.filter((item) => item.kind === "door" || item.kind === "window" || item.kind === "chimney");
-        const loadedItems = copyItems([...draft.items, ...legacyInfrastructure]);
-        setItems(loadedItems);
-        setRoom({ ...defaultRoom, ...(draft.room ?? {}) });
-        setBuild({ ...defaultBuild, ...(draft.build ?? {}) });
-        setPrices({ ...defaultPrices, ...(draft.prices ?? {}) });
-        setNetworks({ ...defaultNetworks, ...(draft.networks ?? {}) });
-        setRoutes(Array.isArray(draft.routes) ? copyRoutes(draft.routes) : automaticRoutes(loadedItems));
+      const draft = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? "null");
+      if (draft?.existing?.length >= 3) {
+        setExisting(copyPoints(draft.existing)); setLining(copyPoints(draft.lining?.length >= 3 ? draft.lining : offsetPolygon(draft.existing, defaultBuild.liningDepth)));
+        setFixtures(copyFixtures(draft.fixtures ?? [])); setObjects(copyObjects(draft.objects ?? [])); setRoutes(copyRoutes(draft.routes ?? []));
+        setBuild({ ...defaultBuild, ...(draft.build ?? {}) }); setBudgetChoices(draft.budgetChoices ?? {}); setProjectName(draft.projectName ?? "Projet rénovation");
       }
-      const saves = JSON.parse(window.localStorage.getItem(SAVES_KEY) ?? "[]");
-      if (Array.isArray(saves)) setSavedConfigs(saves.filter((entry) => entry && typeof entry.name === "string" && isValidItems(entry.items)));
-    } catch { setNotice("Le brouillon local était illisible ; le plan de départ a été restauré."); }
+      const storedProducts = JSON.parse(localStorage.getItem(PRODUCTS_KEY) ?? "null"); if (Array.isArray(storedProducts)) setProducts(storedProducts);
+      const saves = JSON.parse(localStorage.getItem(SAVES_KEY) ?? "[]"); if (Array.isArray(saves)) setSavedProjects(saves);
+    } catch { setNotice("Le brouillon précédent était illisible ; un nouveau projet a été ouvert."); }
     setHydrated(true);
   }, []);
+  useEffect(() => { if (hydrated) localStorage.setItem(DRAFT_KEY, JSON.stringify({ projectName, existing, lining, fixtures, objects, routes, build, budgetChoices })); }, [hydrated, projectName, existing, lining, fixtures, objects, routes, build, budgetChoices]);
+  useEffect(() => { if (hydrated) localStorage.setItem(PRODUCTS_KEY, JSON.stringify(products)); }, [hydrated, products]);
+  useEffect(() => { if (hydrated) localStorage.setItem(SAVES_KEY, JSON.stringify(savedProjects)); }, [hydrated, savedProjects]);
 
-  useEffect(() => {
-    if (!hydrated) return;
-    window.localStorage.setItem(DRAFT_KEY, JSON.stringify({ items, routes, room, build, prices, networks }));
-  }, [hydrated, items, routes, room, build, prices, networks]);
-  useEffect(() => { if (hydrated) window.localStorage.setItem(SAVES_KEY, JSON.stringify(savedConfigs)); }, [hydrated, savedConfigs]);
-
-  function toPlanPoint(event: { clientX: number; clientY: number }) {
-    const svg = svgRef.current; const matrix = svg?.getScreenCTM();
-    if (!svg || !matrix) return null;
-    const point = svg.createSVGPoint(); point.x = event.clientX; point.y = event.clientY;
-    return point.matrixTransform(matrix.inverse());
+  function pointFromEvent(event: { clientX: number; clientY: number }) {
+    const svg = svgRef.current; const matrix = svg?.getScreenCTM(); if (!svg || !matrix) return null;
+    const point = svg.createSVGPoint(); point.x = event.clientX; point.y = event.clientY; return point.matrixTransform(matrix.inverse());
   }
-  const snapped = (value: number) => snapToGrid ? Math.round(value / 5) * 5 : Math.round(value);
-
-  function beginItemGesture(event: ReactPointerEvent<SVGGElement | SVGRectElement>, item: PlanItem, mode: "move" | "resize") {
-    const point = toPlanPoint(event); if (!point) return;
-    event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId);
-    setSelectedId(item.id); setSelectedRouteId(null); setDraggingId(item.id); setActiveTab("element");
-    itemGesture.current = { id: item.id, mode, startX: point.x, startY: point.y, originX: item.x, originY: item.y, originW: item.w, originH: item.h };
+  function clearSelection(except?: "wall" | "fixture" | "object" | "route") {
+    if (except !== "wall") setSelectedWall(null); if (except !== "fixture") setSelectedFixtureId(null); if (except !== "object") setSelectedObjectId(null); if (except !== "route") setSelectedRouteId(null);
+  }
+  function setPoints(layer: Layer, updater: (points: Point[]) => Point[]) { if (layer === "existing") setExisting((current) => updater(current)); else setLining((current) => updater(current)); }
+  function snapPoint(point: Point, points: Point[], index: number) {
+    if (!orthogonalSnap) return { x: round(point.x), y: round(point.y) };
+    const previous = points[(index - 1 + points.length) % points.length]; const next = points[(index + 1) % points.length]; let x = point.x; let y = point.y;
+    if (Math.abs(x - previous.x) < 10) x = previous.x; if (Math.abs(y - previous.y) < 10) y = previous.y;
+    if (Math.abs(x - next.x) < 10) x = next.x; if (Math.abs(y - next.y) < 10) y = next.y;
+    return { x: round(Math.max(0, x)), y: round(Math.max(0, y)) };
   }
 
-  function beginRouteGesture(event: ReactPointerEvent<SVGCircleElement>, route: NetworkRoute, pointIndex: number) {
-    if ((pointIndex === 0 && route.sourceId) || (pointIndex === route.points.length - 1 && route.targetId)) return;
-    const point = toPlanPoint(event); if (!point) return;
-    event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId);
-    const origin = effectivePoints(route, items)[pointIndex];
-    routeGesture.current = { routeId: route.id, pointIndex, startX: point.x, startY: point.y, originX: origin.x, originY: origin.y };
-  }
-
-  function moveGesture(event: ReactPointerEvent<SVGSVGElement>) {
-    const point = toPlanPoint(event); if (!point) return;
-    if (routeGesture.current) {
-      const gesture = routeGesture.current;
-      setRoutes((current) => current.map((route) => route.id === gesture.routeId ? { ...route, points: route.points.map((routePoint, index) => index === gesture.pointIndex ? { x: clamp(snapped(gesture.originX + point.x - gesture.startX), 0, room.width), y: clamp(snapped(gesture.originY + point.y - gesture.startY), 0, room.depth) } : routePoint) } : route));
-      return;
-    }
-    const gesture = itemGesture.current; if (!gesture) return;
-    setItems((current) => current.map((item) => {
-      if (item.id !== gesture.id) return item;
-      const dx = point.x - gesture.startX; const dy = point.y - gesture.startY;
-      if (gesture.mode === "move") return { ...item, x: clamp(snapped(gesture.originX + dx), 0, room.width - item.w), y: clamp(snapped(gesture.originY + dy), 0, room.depth - item.h) };
-      return { ...item, w: clamp(snapped(gesture.originW + dx), 10, room.width - item.x), h: clamp(snapped(gesture.originH + dy), 10, room.depth - item.y) };
+  function onPointerMove(event: ReactPointerEvent<SVGSVGElement>) {
+    const pointer = pointFromEvent(event); const drag = dragRef.current; if (!pointer || !drag) return;
+    if (drag.type === "wall-point") setPoints(drag.layer, (points) => points.map((point, index) => index === drag.index ? snapPoint(pointer, points, index) : point));
+    if (drag.type === "fixture") setFixtures((current) => current.map((fixture) => {
+      if (fixture.id !== drag.id) return fixture; const points = fixture.layer === "existing" ? existing : lining; const wall = segment(points, fixture.wallIndex); const dx = wall.b.x - wall.a.x; const dy = wall.b.y - wall.a.y; const squared = dx * dx + dy * dy || 1;
+      return { ...fixture, offset: clamp(((pointer.x - wall.a.x) * dx + (pointer.y - wall.a.y) * dy) / squared, 0.02, 0.98) };
     }));
-  }
-
-  function endGesture() {
-    if (itemGesture.current || routeGesture.current) setNotice("Modification enregistrée dans le brouillon");
-    itemGesture.current = null; routeGesture.current = null; setDraggingId(null);
-  }
-
-  function updateSelected(changes: Partial<PlanItem>) {
-    if (!selectedId) return;
-    setItems((current) => current.map((item) => {
-      if (item.id !== selectedId) return item;
-      const next = { ...item, ...changes };
-      next.w = clamp(next.w, 10, room.width); next.h = clamp(next.h, 10, room.depth);
-      next.x = clamp(next.x, 0, room.width - next.w); next.y = clamp(next.y, 0, room.depth - next.h);
-      return next;
+    if (drag.type === "object" || drag.type === "resize-object") setObjects((current) => current.map((object) => {
+      if (object.id !== drag.id) return object; const dx = pointer.x - drag.start.x; const dy = pointer.y - drag.start.y;
+      return drag.type === "object" ? { ...object, x: round(Math.max(0, drag.origin.x + dx)), y: round(Math.max(0, drag.origin.y + dy)) } : { ...object, w: Math.max(20, round(drag.origin.x + dx)), h: Math.max(20, round(drag.origin.y + dy)) };
     }));
+    if (drag.type === "route-point") setRoutes((current) => current.map((route) => route.id === drag.routeId ? { ...route, points: route.points.map((point, index) => index === drag.pointIndex ? { x: Math.max(0, round(drag.origin.x + pointer.x - drag.start.x)), y: Math.max(0, round(drag.origin.y + pointer.y - drag.start.y)) } : point) } : route));
   }
+  function endDrag() { if (dragRef.current) setNotice("Modification enregistrée"); dragRef.current = null; }
 
-  function updateRoom(changes: Partial<RoomSettings>) {
-    const next = { ...room, ...changes };
-    next.width = clamp(next.width, 200, 900); next.depth = clamp(next.depth, 200, 900); next.height = clamp(next.height, 180, 500);
-    setRoom(next);
-    setItems((current) => current.map((item) => ({ ...item, w: Math.min(item.w, next.width), h: Math.min(item.h, next.depth), x: clamp(item.x, 0, next.width - Math.min(item.w, next.width)), y: clamp(item.y, 0, next.depth - Math.min(item.h, next.depth)) })));
+  function beginPointDrag(event: ReactPointerEvent<SVGCircleElement>, layer: Layer, index: number) { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "wall-point", layer, index }; setSelectedWall({ layer, index: Math.max(0, index - 1) }); clearSelection("wall"); }
+  function beginFixtureDrag(event: ReactPointerEvent<SVGGElement>, fixture: WallFixture) { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "fixture", id: fixture.id }; setSelectedFixtureId(fixture.id); clearSelection("fixture"); }
+  function beginObjectDrag(event: ReactPointerEvent<SVGGElement | SVGRectElement>, object: PlanObject, type: "object" | "resize-object") { const pointer = pointFromEvent(event); if (!pointer) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type, id: object.id, start: pointer, origin: type === "object" ? { x: object.x, y: object.y } : { x: object.w, y: object.h } }; setSelectedObjectId(object.id); clearSelection("object"); }
+
+  function updateSelectedWallLength(length: number) {
+    if (!selectedWall) return; setPoints(selectedWall.layer, (points) => { const next = copyPoints(points); const { a, b } = segment(points, selectedWall.index); const angle = Math.atan2(b.y - a.y, b.x - a.x); next[(selectedWall.index + 1) % points.length] = { x: round(a.x + Math.cos(angle) * length), y: round(a.y + Math.sin(angle) * length) }; return next; });
   }
-
-  function nudgeSelected(event: ReactKeyboardEvent<SVGGElement>, item: PlanItem) {
-    const directions: Record<string, [number, number]> = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1] };
-    if (directions[event.key]) { event.preventDefault(); const [dx, dy] = directions[event.key]; const step = event.shiftKey ? 10 : 5; updateSelected({ x: clamp(item.x + dx * step, 0, room.width - item.w), y: clamp(item.y + dy * step, 0, room.depth - item.h) }); }
-    if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); removeSelected(); }
+  function updateSelectedWallAngle(angleDegrees: number) {
+    if (!selectedWall) return; setPoints(selectedWall.layer, (points) => { const next = copyPoints(points); const { a } = segment(points, selectedWall.index); const length = segmentLength(points, selectedWall.index); const angle = angleDegrees * Math.PI / 180; next[(selectedWall.index + 1) % points.length] = { x: round(a.x + Math.cos(angle) * length), y: round(a.y + Math.sin(angle) * length) }; return next; });
   }
-
-  function addItem(kind: ItemKind) {
-    const spec = specs[kind]; const offset = (items.length * 13) % 90;
-    const isOpening = kind === "door" || kind === "window";
-    const item: PlanItem = { id: `${kind}-${uid()}`, kind, name: spec.label, x: clamp(195 + offset, 0, room.width - spec.defaultW), y: isOpening ? room.depth - spec.defaultH : clamp(285 + offset / 2, 0, room.depth - spec.defaultH), w: spec.defaultW, h: spec.defaultH, ...(isOpening ? { openingHeight: kind === "door" ? 215 : 110 } : {}) };
-    const all = [...items, item]; setItems(all);
-    setRoutes((current) => [...current, ...linkedRoutesForItem(all, item, uid())]);
-    setSelectedId(item.id); setSelectedRouteId(null); setActiveTab("element"); setNotice(`${spec.label} ajouté au plan`);
+  function addWallPoint() { if (!selectedWall) return; setPoints(selectedWall.layer, (points) => { const next = copyPoints(points); const wall = segment(points, selectedWall.index); next.splice(selectedWall.index + 1, 0, { x: (wall.a.x + wall.b.x) / 2, y: (wall.a.y + wall.b.y) / 2 }); return next; }); setNotice("Point ajouté au mur"); }
+  function addRecess() {
+    if (!selectedWall) return; setPoints(selectedWall.layer, (points) => { const next = copyPoints(points); const { a, b } = segment(points, selectedWall.index); const dx = b.x - a.x; const dy = b.y - a.y; const length = Math.hypot(dx, dy) || 1; const tx = dx / length; const ty = dy / length; const nx = -ty; const ny = tx; const start = 0.32; const end = 0.68; const depth = 30;
+      next.splice(selectedWall.index + 1, 0, { x: a.x + dx * start, y: a.y + dy * start }, { x: a.x + dx * start + nx * depth, y: a.y + dy * start + ny * depth }, { x: a.x + dx * end + nx * depth, y: a.y + dy * end + ny * depth }, { x: a.x + dx * end, y: a.y + dy * end }); return next; }); setNotice("Décroché ajouté — déplace ses points pour l’ajuster");
   }
+  function deleteWallPoint() { if (!selectedWall || layerPoints.length <= 3) return; const deleteIndex = (selectedWall.index + 1) % layerPoints.length; setPoints(selectedWall.layer, (points) => points.filter((_, index) => index !== deleteIndex)); setSelectedWall({ ...selectedWall, index: Math.max(0, selectedWall.index - 1) }); }
+  function alignWall(axis: "horizontal" | "vertical") { if (!selectedWall) return; setPoints(selectedWall.layer, (points) => { const next = copyPoints(points); const { a, b } = segment(points, selectedWall.index); next[(selectedWall.index + 1) % points.length] = axis === "horizontal" ? { x: b.x, y: a.y } : { x: a.x, y: b.y }; return next; }); }
+  function regenerateLining() { const next = offsetPolygon(existing, build.liningDepth); setLining(next); setFixtures((current) => current.map((fixture) => fixture.layer === "lining" ? { ...fixture, wallIndex: Math.min(fixture.wallIndex, next.length - 1) } : fixture)); setRoutes((current) => automaticRoutes(fixtures, existing, next).concat(current.filter((route) => !route.targetFixtureId))); setNotice("Doublage BA13 régénéré depuis les murs existants"); }
 
-  function removeSelected() {
-    if (!selectedId) return;
-    const item = items.find((candidate) => candidate.id === selectedId);
-    setItems((current) => current.filter((candidate) => candidate.id !== selectedId));
-    setRoutes((current) => current.filter((route) => route.sourceId !== selectedId && route.targetId !== selectedId));
-    setSelectedId(null); setNotice(item ? `${item.name} supprimé` : "Élément supprimé");
+  function addFixture(kind: FixtureKind) {
+    const layer: Layer = kind === "door" || kind === "window" ? "existing" : "lining"; const points = layer === "existing" ? existing : lining; const wallIndex = selectedWall?.layer === layer ? selectedWall.index : 0;
+    const fixture: WallFixture = { id: `${kind}-${uid()}`, kind, name: fixtureMeta[kind].label, layer, wallIndex: Math.min(wallIndex, points.length - 1), offset: 0.5, width: kind === "door" ? 90 : kind === "window" ? 120 : 8, height: kind === "door" ? 215 : kind === "window" ? 110 : 8, mountHeight: kind === "window" ? 90 : kind === "outlet" ? 30 : 0, quantity: 1 };
+    const all = [...fixtures, fixture]; setFixtures(all); const network = fixtureNetwork(kind); if (network) setRoutes((current) => [...current, ...automaticRoutes(all, existing, lining).filter((route) => route.targetFixtureId === fixture.id)]); setSelectedFixtureId(fixture.id); clearSelection("fixture"); setNotice(`${fixture.name} fixé au mur`);
   }
+  function updateFixture(changes: Partial<WallFixture>) { if (selectedFixtureId) setFixtures((current) => current.map((fixture) => fixture.id === selectedFixtureId ? { ...fixture, ...changes } : fixture)); }
+  function deleteFixture() { if (!selectedFixtureId) return; setFixtures((current) => current.filter((fixture) => fixture.id !== selectedFixtureId)); setRoutes((current) => current.filter((route) => route.sourceFixtureId !== selectedFixtureId && route.targetFixtureId !== selectedFixtureId)); setSelectedFixtureId(null); }
 
-  function duplicateSelected() {
-    if (!selected) return;
-    const duplicate = { ...selected, id: `${selected.kind}-${uid()}`, name: `${selected.name} – copie`, x: clamp(selected.x + 20, 0, room.width - selected.w), y: clamp(selected.y + 20, 0, room.depth - selected.h) };
-    const all = [...items, duplicate]; setItems(all); setRoutes((current) => [...current, ...linkedRoutesForItem(all, duplicate, uid())]); setSelectedId(duplicate.id); setNotice("Élément dupliqué");
-  }
+  function addObject(kind: ObjectKind) { const meta = objectMeta[kind]; const object = { id: `${kind}-${uid()}`, kind, name: meta.label, x: 170, y: 190, w: meta.w, h: meta.h }; setObjects((current) => [...current, object]); setSelectedObjectId(object.id); clearSelection("object"); }
+  function updateObject(changes: Partial<PlanObject>) { if (selectedObjectId) setObjects((current) => current.map((object) => object.id === selectedObjectId ? { ...object, ...changes } : object)); }
 
-  function addFreeRoute(kind: NetworkKind) {
-    const source = items.find((item) => specs[item.kind].source === kind);
-    const start = source ? centerOf(source) : { x: 40, y: 40 }; const end = { x: room.width / 2, y: room.depth / 2 };
-    const route: NetworkRoute = { id: `route-${uid()}`, kind, name: `${networkLabel(kind)} libre`, sourceId: source?.id, points: [start, { x: start.x, y: end.y }, end] };
-    setRoutes((current) => [...current, route]); setSelectedRouteId(route.id); setSelectedId(null); setActiveTab("networks"); setNotice(`${networkLabel(kind)} libre ajouté`);
-  }
+  function addFreeRoute(kind: NetworkKind) { const source = fixtures.find((fixture) => fixtureSource(fixture.kind) === kind); const start = source ? fixturePosition(source, existing, lining) : { x: 40, y: 40 }; const end = { x: 300, y: 260 }; const route = { id: `route-${uid()}`, kind, name: `${networkName(kind)} libre`, sourceFixtureId: source?.id, points: [start, { x: start.x, y: end.y }, end] }; setRoutes((current) => [...current, route]); setSelectedRouteId(route.id); clearSelection("route"); }
+  function addRoutePoint() { if (!selectedRoute) return; const points = effectiveRoutePoints(selectedRoute, fixtures, existing, lining); const index = Math.max(1, points.length - 1); const a = points[index - 1]; const b = points[index]; setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, points: [...route.points.slice(0, index), { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, ...route.points.slice(index)] } : route)); }
 
-  function addRoutePoint() {
-    if (!selectedRoute) return;
-    const points = effectivePoints(selectedRoute, items); let index = 1; let longest = -1;
-    for (let i = 1; i < points.length; i += 1) { const length = Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y); if (length > longest) { longest = length; index = i; } }
-    const a = points[index - 1]; const b = points[index]; const next = [...selectedRoute.points]; next.splice(index, 0, { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
-    setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, points: next } : route));
-  }
+  function saveProject() { const name = projectName.trim() || "Projet sans nom"; const saved: SavedProject = { id: uid(), name, updatedAt: new Date().toISOString(), existing: copyPoints(existing), lining: copyPoints(lining), fixtures: copyFixtures(fixtures), objects: copyObjects(objects), routes: copyRoutes(routes), build: { ...build }, budgetChoices: { ...budgetChoices } }; setSavedProjects((current) => [saved, ...current]); setNotice(`« ${name} » sauvegardé`); }
+  function loadProject(project: SavedProject) { setProjectName(project.name); setExisting(copyPoints(project.existing)); setLining(copyPoints(project.lining)); setFixtures(copyFixtures(project.fixtures)); setObjects(copyObjects(project.objects)); setRoutes(copyRoutes(project.routes)); setBuild({ ...project.build }); setBudgetChoices({ ...project.budgetChoices }); setNotice(`« ${project.name} » chargé`); }
 
-  function removeRoutePoint() {
-    if (!selectedRoute || selectedRoute.points.length <= 2) return;
-    setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, points: route.points.filter((_, index) => index !== route.points.length - 2) } : route));
-  }
+  function addProduct() { if (!newProduct.name.trim()) return; setProducts((current) => [{ ...newProduct, id: uid() }, ...current]); setNewProduct((current) => ({ ...current, name: "", reference: "", price: 0 })); setNotice("Produit ajouté à la bibliothèque"); }
+  function updateProduct(id: string, changes: Partial<Product>) { setProducts((current) => current.map((product) => product.id === id ? { ...product, ...changes } : product)); }
+  function importProducts(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => { try { const text = String(reader.result ?? ""); const lines = text.split(/\r?\n/).filter(Boolean); const delimiter = lines[0]?.includes(";") ? ";" : ","; const imported = lines.slice(1).map((line) => { const [name, reference, category, store, price, coverage, unit, packLabel, url] = line.split(delimiter).map((value) => value.trim()); if (!name) return null; return { id: uid(), name, reference: reference ?? "", category: (category as ProductCategory) || "consommables", store: store ?? "", price: Number(String(price).replace(",", ".")) || 0, coverage: Number(String(coverage).replace(",", ".")) || 1, coverageUnit: unit || "u", packLabel: packLabel || "unité", url: url ?? "", checkedAt: new Date().toISOString().slice(0, 10) } as Product; }).filter(Boolean) as Product[]; setProducts((current) => [...imported, ...current]); setNotice(`${imported.length} produits importés`); } catch { setNotice("Import impossible : vérifie le format CSV"); } }; reader.readAsText(file); event.target.value = ""; }
 
-  function resetPlan() {
-    setRoom(defaultRoom); setBuild(defaultBuild); setItems(copyItems(defaultItems)); setRoutes(automaticRoutes(defaultItems)); setPrices(defaultPrices); setNetworks(defaultNetworks); setSelectedId("prep"); setSelectedRouteId(null); setCurrentConfigId(null); setConfigName("Configuration péninsule"); setNotice("Plan de départ restauré");
-  }
-
-  function configurationSnapshot(id: string, name: string): SavedConfiguration {
-    return { id, name, updatedAt: new Date().toISOString(), items: copyItems(items), routes: copyRoutes(routes), room: { ...room }, build: { ...build }, prices: { ...prices }, networks: { ...networks } };
-  }
-  function saveNewConfiguration() { const name = configName.trim() || `Configuration ${savedConfigs.length + 1}`; const saved = configurationSnapshot(uid(), name); setSavedConfigs((current) => [saved, ...current]); setCurrentConfigId(saved.id); setConfigName(name); setNotice(`« ${name} » sauvegardée`); }
-  function updateCurrentConfiguration() { if (!currentConfigId) return; const name = configName.trim() || "Configuration sans nom"; setSavedConfigs((current) => current.map((entry) => entry.id === currentConfigId ? configurationSnapshot(currentConfigId, name) : entry)); setNotice(`« ${name} » mise à jour`); }
-  function loadConfiguration(configuration: SavedConfiguration) { const loadedItems = copyItems(configuration.items); setItems(loadedItems); setRoom({ ...defaultRoom, ...(configuration.room ?? {}) }); setBuild({ ...defaultBuild, ...(configuration.build ?? {}) }); setPrices({ ...defaultPrices, ...(configuration.prices ?? {}) }); setNetworks({ ...defaultNetworks, ...configuration.networks }); setRoutes(configuration.routes ? copyRoutes(configuration.routes) : automaticRoutes(loadedItems)); setCurrentConfigId(configuration.id); setConfigName(configuration.name); setSelectedId(null); setSelectedRouteId(null); setNotice(`« ${configuration.name} » chargée`); }
-  function deleteConfiguration(id: string) { const removed = savedConfigs.find((entry) => entry.id === id); setSavedConfigs((current) => current.filter((entry) => entry.id !== id)); if (currentConfigId === id) setCurrentConfigId(null); setNotice(removed ? `« ${removed.name} » supprimée` : "Configuration supprimée"); }
-
-  const routePath = (route: NetworkRoute) => effectivePoints(route, items).map((point, index) => `${index ? "L" : "M"} ${point.x} ${point.y}`).join(" ");
-  const fmt = (value: number) => new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(value);
+  const wallPath = (points: Point[]) => points.map((point, index) => `${index ? "L" : "M"}${point.x},${point.y}`).join(" ") + " Z";
+  const routePath = (route: NetworkRoute) => effectiveRoutePoints(route, fixtures, existing, lining).map((point, index) => `${index ? "L" : "M"}${point.x},${point.y}`).join(" ");
+  const euros = (value: number) => new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(value);
 
   return (
-    <main>
-      <header className="site-header">
-        <div><p className="eyebrow">Atelier cuisine & rénovation</p><h1>Dessine, raccorde et chiffre toute la pièce.</h1><p className="intro">Le plan reste ajustable tant que les cotes ne sont pas définitives. Chaque tracé, ouverture, prise et matériau alimente le métré et le budget.</p></div>
-        <div className="header-tools"><button type="button" className="text-action" onClick={resetPlan}>Plan de départ</button><button type="button" className="print-action" onClick={() => window.print()}>Imprimer</button><div className="header-mark" aria-hidden="true">EG</div></div>
+    <main className="app-shell">
+      <header className="app-header">
+        <div className="brand"><div className="brand-mark">AR</div><div><strong>Atelier Rénovation</strong><span>Plan · réseaux · matériaux</span></div></div>
+        <nav className="mode-nav" aria-label="Modes de travail">{([["plan", "Plan"], ["layout", "Aménagement"], ["networks", "Réseaux"], ["budget", "Budget"], ["products", "Produits"]] as [Mode, string][]).map(([value, label]) => <button type="button" key={value} className={mode === value ? "active" : ""} onClick={() => { setMode(value); clearSelection(); }}>{label}</button>)}</nav>
+        <div className="project-actions"><input value={projectName} aria-label="Nom du projet" onChange={(event) => setProjectName(event.target.value)} /><button type="button" className="save-button" onClick={saveProject}>Sauvegarder</button><details className="project-menu"><summary aria-label="Projets sauvegardés">{savedProjects.length}</summary><div><strong>Projets sauvegardés</strong>{savedProjects.length ? savedProjects.map((project) => <button type="button" key={project.id} onClick={() => loadProject(project)}><span>{project.name}</span><small>{new Date(project.updatedAt).toLocaleDateString("fr-FR")}</small></button>) : <p>Aucun projet nommé</p>}</div></details></div>
       </header>
 
-      <section className="status-strip" aria-live="polite"><span className="status-dot" /><span>{notice}</span><span className="status-spacer" /><strong>{room.width} × {room.depth} × H {room.height} cm</strong><strong>{items.length} éléments</strong><strong className={collisions ? "status-alert" : ""}>{collisions ? `${collisions} chevauchement${collisions > 1 ? "s" : ""}` : "Aucun chevauchement"}</strong></section>
+      <section className="context-bar"><div><span className={`mode-dot mode-dot-${mode}`} /> <strong>{mode === "plan" ? "Structure du bâti" : mode === "layout" ? "Volumes et aménagement" : mode === "networks" ? `${networkName(networkFilter)} uniquement` : mode === "budget" ? "Métré et achats" : "Bibliothèque de produits"}</strong><small>{notice}</small></div><div className="quick-metrics"><span><b>{metrics.floor.toFixed(1)}</b> m² au sol</span><span><b>{metrics.wallNet.toFixed(1)}</b> m² de murs nets</span><span><b>{euros(grandTotal)}</b> estimés</span></div></section>
 
-      <section className="workspace">
-        <div className="plan-shell">
-          <div className="plan-toolbar">
-            <div><span className="section-kicker">Plan de la pièce</span><strong>Meubles et points techniques déplaçables · réseaux avec coudes manuels</strong></div>
-            <div className="toolbar-toggles"><button type="button" className="room-edit-button" onClick={() => { setSelectedId(null); setSelectedRouteId(null); setActiveTab("element"); }}>Modifier la pièce</button><label><input type="checkbox" checked={snapToGrid} onChange={(event) => setSnapToGrid(event.target.checked)} /> Aimant 5 cm</label><label><input type="checkbox" checked={showGrid} onChange={(event) => setShowGrid(event.target.checked)} /> Grille</label><label><input type="checkbox" checked={showDimensions} onChange={(event) => setShowDimensions(event.target.checked)} /> Cotes</label></div>
+      <section className={`main-workspace mode-${mode}`}>
+        <div className="canvas-panel">
+          <div className="canvas-toolbar">
+            <div className="layer-legend"><span><i className="legend-existing" />Mur existant</span><span><i className="legend-lining" />Doublage BA13</span>{mode === "networks" && <span><i className={`legend-${networkFilter}`} />{networkName(networkFilter)}</span>}</div>
+            <div><label><input type="checkbox" checked={showDimensions} onChange={(event) => setShowDimensions(event.target.checked)} /> Cotes</label>{mode === "plan" && <label><input type="checkbox" checked={orthogonalSnap} onChange={(event) => setOrthogonalSnap(event.target.checked)} /> Aimant 90°</label>}<button type="button" onClick={() => window.print()}>Imprimer</button></div>
           </div>
 
-          <div className="network-legend">{(["electric", "cold", "hot"] as NetworkKind[]).map((kind) => <button type="button" key={kind} className={`legend-chip legend-${kind} ${networks[kind] ? "is-on" : ""}`} aria-pressed={networks[kind]} onClick={() => setNetworks((current) => ({ ...current, [kind]: !current[kind] }))}><span />{networkLabel(kind)} · {networkTotals[kind].toFixed(1)} m</button>)}</div>
+          <div className="drawing-stage">
+            <svg ref={svgRef} viewBox={`-55 -55 ${bounds.maxX + 60} ${bounds.maxY + 60}`} role="img" aria-label="Plan interactif de rénovation" onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
+              <defs><pattern id="cad-grid" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M10 0H0V10" fill="none" /></pattern><filter id="soft-shadow"><feDropShadow dx="0" dy="3" stdDeviation="3" floodOpacity=".16" /></filter></defs>
+              <rect x="-40" y="-40" width={bounds.maxX + 20} height={bounds.maxY + 20} className="canvas-bg" onPointerDown={() => clearSelection()} />
+              <rect x="-40" y="-40" width={bounds.maxX + 20} height={bounds.maxY + 20} fill="url(#cad-grid)" pointerEvents="none" />
+              <path d={wallPath(existing)} className="room-fill" pointerEvents="none" />
 
-          <div className="plan-stage">
-            <svg ref={svgRef} viewBox={`-45 -45 ${room.width + 90} ${room.depth + 90}`} role="img" aria-label="Éditeur interactif du plan, des meubles et des réseaux" onPointerMove={moveGesture} onPointerUp={endGesture} onPointerCancel={endGesture} onPointerLeave={endGesture}>
-              <defs><pattern id="grid" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M 10 0 L 0 0 0 10" className="grid-line" fill="none" /></pattern><filter id="module-shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="3" stdDeviation="3" floodColor="#1f2b29" floodOpacity="0.13" /></filter></defs>
-              <rect x="0" y="0" width={room.width} height={room.depth} className="floor" onPointerDown={() => { setSelectedId(null); setSelectedRouteId(null); setActiveTab("element"); }} />
-              {showGrid && <rect x="0" y="0" width={room.width} height={room.depth} fill="url(#grid)" opacity="0.58" pointerEvents="none" />}
-              <rect x="0" y="0" width={room.width} height={room.depth} className="editable-room-wall" pointerEvents="none" />
-              <g pointerEvents="none"><text x={room.width / 2} y="-17" textAnchor="middle" className="room-size">{room.width} cm</text><text x="-24" y={room.depth / 2} textAnchor="middle" className="room-size" transform={`rotate(-90 -24 ${room.depth / 2})`}>{room.depth} cm</text></g>
+              {existing.map((_, index) => { const wall = segment(existing, index); const selected = selectedWall?.layer === "existing" && selectedWall.index === index; return <g key={`existing-${index}`}><line className="wall-hit" x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedWall({ layer: "existing", index }); clearSelection("wall"); }} /><line className={`wall-line existing-wall ${selected ? "selected" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" />{mode === "plan" && showDimensions && <g className="wall-dimension" transform={`translate(${(wall.a.x + wall.b.x) / 2},${(wall.a.y + wall.b.y) / 2})`}><rect x="-23" y="-9" width="46" height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{Math.round(segmentLength(existing, index))} cm</text></g>}</g>; })}
+              {lining.map((_, index) => { const wall = segment(lining, index); const selected = selectedWall?.layer === "lining" && selectedWall.index === index; return <g key={`lining-${index}`}><line className="wall-hit" x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedWall({ layer: "lining", index }); clearSelection("wall"); }} /><line className={`wall-line lining-wall ${selected ? "selected" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" /></g>; })}
 
-              <g className="network-routes">
-                {routes.filter((route) => networks[route.kind]).map((route) => <g key={route.id} className={`network-line network-${route.kind} ${selectedRouteId === route.id ? "selected" : ""}`}><path className="route-hit" d={routePath(route)} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedRouteId(route.id); setSelectedId(null); setActiveTab("networks"); }} /><path d={routePath(route)} pointerEvents="none" /></g>)}
-              </g>
+              {mode === "plan" && (selectedWall?.layer === "existing" ? existing : lining).map((point, index) => <circle key={`vertex-${index}`} className={`wall-vertex ${selectedWall?.layer === "lining" ? "lining-vertex" : ""}`} cx={point.x} cy={point.y} r="6" onPointerDown={(event) => beginPointDrag(event, selectedWall?.layer ?? "existing", index)} />)}
 
-              <g className="plan-items">
-                {items.map((item) => {
-                  const spec = specs[item.kind]; const isSource = Boolean(spec.source); const isOpening = item.kind === "door" || item.kind === "window" || item.kind === "chimney"; const isSelected = item.id === selectedId; const center = centerOf(item);
-                  if (isSource) return <g key={item.id} className={`source-item source-${spec.source} ${isSelected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={`${item.name}, déplacer sur le plan`} onPointerDown={(event) => beginItemGesture(event, item, "move")} onKeyDown={(event) => nudgeSelected(event, item)}><circle cx={center.x} cy={center.y} r={item.w / 2} /><text x={center.x} y={center.y} textAnchor="middle" dominantBaseline="middle">{spec.short}</text><text className="source-caption" x={center.x} y={center.y + item.h / 2 + 13} textAnchor="middle">{item.name}</text></g>;
-                  return <g key={item.id} className={`plan-item ${isOpening ? `opening-item opening-${item.kind}` : ""} ${isSelected ? "selected" : ""} ${draggingId === item.id ? "dragging" : ""}`} role="button" tabIndex={0} aria-label={`${item.name}, ${Math.round(item.w)} par ${Math.round(item.h)} centimètres`} onPointerDown={(event) => beginItemGesture(event, item, "move")} onKeyDown={(event) => nudgeSelected(event, item)}><rect x={item.x} y={item.y} width={item.w} height={item.h} rx="2" fill={spec.color} /><rect className="item-inner" x={item.x + 3} y={item.y + 3} width={Math.max(0, item.w - 6)} height={Math.max(0, item.h - 6)} rx="1" /><text className="item-label" x={center.x} y={center.y - (showDimensions && item.h > 25 ? 5 : 0)} textAnchor="middle" dominantBaseline="middle">{item.w < 45 ? spec.short : item.name}</text>{showDimensions && item.h > 25 && <text className="item-size" x={center.x} y={center.y + 12} textAnchor="middle" dominantBaseline="middle">{Math.round(item.w)} × {Math.round(item.h)}</text>}{isSelected && <rect className="resize-handle" x={item.x + item.w - 7} y={item.y + item.h - 7} width="14" height="14" rx="2" onPointerDown={(event) => beginItemGesture(event, item, "resize")} />}</g>;
-                })}
-              </g>
+              {fixtures.filter((fixture) => mode === "plan" ? fixtureMeta[fixture.kind].opening : mode === "networks" ? fixtureNetwork(fixture.kind) === networkFilter || fixtureSource(fixture.kind) === networkFilter : mode === "layout" ? fixtureMeta[fixture.kind].opening : false).map((fixture) => {
+                const points = fixture.layer === "existing" ? existing : lining; const wall = segment(points, Math.min(fixture.wallIndex, points.length - 1)); const position = fixturePosition(fixture, existing, lining); const length = Math.hypot(wall.b.x - wall.a.x, wall.b.y - wall.a.y) || 1; const tx = (wall.b.x - wall.a.x) / length; const ty = (wall.b.y - wall.a.y) / length; const half = fixture.width / 2; const opening = fixtureMeta[fixture.kind].opening; const selected = selectedFixtureId === fixture.id;
+                return <g key={fixture.id} className={`wall-fixture ${opening ? "opening-fixture" : "technical-fixture"} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={fixture.name} onPointerDown={(event) => beginFixtureDrag(event, fixture)}>{opening ? <><line x1={position.x - tx * half} y1={position.y - ty * half} x2={position.x + tx * half} y2={position.y + ty * half} stroke={fixtureMeta[fixture.kind].color} /><text x={position.x} y={position.y - 11} textAnchor="middle">{fixture.name}</text></> : <><circle cx={position.x} cy={position.y} r="9" fill={fixtureMeta[fixture.kind].color} /><text x={position.x} y={position.y} textAnchor="middle" dominantBaseline="middle">{fixtureMeta[fixture.kind].short}</text>{fixture.quantity > 1 && <text className="fixture-quantity" x={position.x + 9} y={position.y - 9}>{fixture.quantity}</text>}</>}</g>;
+              })}
 
-              {selectedRoute && networks[selectedRoute.kind] && <g className={`route-handles route-${selectedRoute.kind}`}>{effectivePoints(selectedRoute, items).map((point, index) => { const anchored = (index === 0 && selectedRoute.sourceId) || (index === selectedRoute.points.length - 1 && selectedRoute.targetId); return <circle key={index} cx={point.x} cy={point.y} r={anchored ? 4 : 7} className={anchored ? "anchored" : "movable"} onPointerDown={(event) => beginRouteGesture(event, selectedRoute, index)} />; })}</g>}
+              {(mode === "layout" || mode === "networks") && objects.map((object) => { const selected = selectedObjectId === object.id; return <g key={object.id} className={`plan-object ${mode === "networks" ? "ghost" : ""} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={object.name} onPointerDown={(event) => beginObjectDrag(event, object, "object")}><rect x={object.x} y={object.y} width={object.w} height={object.h} rx="3" fill={objectMeta[object.kind].color} /><text x={object.x + object.w / 2} y={object.y + object.h / 2} textAnchor="middle" dominantBaseline="middle">{object.name}</text>{mode === "layout" && <text className="object-size" x={object.x + object.w / 2} y={object.y + object.h / 2 + 14} textAnchor="middle">{Math.round(object.w)} × {Math.round(object.h)}</text>}{selected && mode === "layout" && <rect className="resize-handle" x={object.x + object.w - 7} y={object.y + object.h - 7} width="14" height="14" rx="3" onPointerDown={(event) => beginObjectDrag(event, object, "resize-object")} />}</g>; })}
+
+              {mode === "networks" && routes.filter((route) => route.kind === networkFilter).map((route) => <g key={route.id} className={`network-route route-${route.kind} ${selectedRouteId === route.id ? "selected" : ""}`}><path className="route-hit" d={routePath(route)} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedRouteId(route.id); clearSelection("route"); }} /><path d={routePath(route)} pointerEvents="none" /></g>)}
+              {mode === "networks" && selectedRoute && selectedRoute.kind === networkFilter && <g className={`route-handles handles-${selectedRoute.kind}`}>{effectiveRoutePoints(selectedRoute, fixtures, existing, lining).map((point, index) => { const anchored = index === 0 && selectedRoute.sourceFixtureId || index === selectedRoute.points.length - 1 && selectedRoute.targetFixtureId; return <circle key={index} cx={point.x} cy={point.y} r={anchored ? 4 : 7} className={anchored ? "anchored" : "movable"} onPointerDown={(event) => { if (anchored) return; const start = pointFromEvent(event); if (!start) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "route-point", routeId: selectedRoute.id, pointIndex: index, start, origin: point }; }} />; })}</g>}
             </svg>
           </div>
-
-          <div className="plan-foot"><div><span>Surface au sol</span><strong>{roomMetrics.floor.toFixed(1)} m²</strong></div><div><span>Murs nets</span><strong>{roomMetrics.wallNet.toFixed(1)} m²</strong></div><div><span>Réseaux cumulés</span><strong>{Object.values(networkTotals).reduce((a, b) => a + b, 0).toFixed(1)} m</strong></div><div><span>Budget matériaux</span><strong>{fmt(grandTotal)}</strong></div></div>
+          <div className="canvas-footer"><span><b>{existing.length}</b> angles du bâti</span><span><b>{metrics.existingPerimeter.toFixed(1)} m</b> de murs existants</span><span><b>{metrics.liningPerimeter.toFixed(1)} m</b> de doublage</span><span><b>{metrics.openingArea.toFixed(1)} m²</b> d’ouvertures déduites</span></div>
         </div>
 
-        <aside className="control-panel">
-          <div className="panel-tabs" role="tablist" aria-label="Outils du configurateur">{([["element", "Sélection"], ["catalog", "Ajouter"], ["networks", "Réseaux"], ["budget", "Budget"], ["saves", "Plans"]] as [PanelTab, string][]).map(([tab, label]) => <button key={tab} type="button" role="tab" aria-selected={activeTab === tab} className={activeTab === tab ? "active" : ""} onClick={() => setActiveTab(tab)}>{label}</button>)}</div>
+        <aside className="inspector-panel">
+          {mode === "plan" && <div className="inspector-content"><div className="panel-title"><span>01 · Structure</span><h2>Murs et doublages</h2><p>Dessine la forme réelle, y compris les biais et les décrochements.</p></div><div className="layer-switch"><button type="button" className={selectedWall?.layer !== "lining" ? "active" : ""} onClick={() => { setSelectedWall({ layer: "existing", index: 0 }); clearSelection("wall"); }}>Murs existants</button><button type="button" className={selectedWall?.layer === "lining" ? "active" : ""} onClick={() => { setSelectedWall({ layer: "lining", index: 0 }); clearSelection("wall"); }}>Doublage BA13</button></div>{selectedWall ? <><div className="selection-card"><span className="selection-label">{selectedWall.layer === "existing" ? "Mur existant" : "Doublage BA13"} · segment {selectedWall.index + 1}</span><div className="field-grid"><NumberInput label="Longueur" value={segmentLength(layerPoints, selectedWall.index)} min={10} onChange={updateSelectedWallLength} /><NumberInput label="Angle" value={segmentAngle(layerPoints, selectedWall.index)} unit="°" min={-180} max={180} onChange={updateSelectedWallAngle} /></div><div className="tool-grid"><button type="button" onClick={() => alignWall("horizontal")}>Aligner horizontal</button><button type="button" onClick={() => alignWall("vertical")}>Aligner vertical</button><button type="button" onClick={addWallPoint}>＋ Point intermédiaire</button><button type="button" onClick={addRecess}>＋ Décroché</button><button type="button" className="danger" disabled={layerPoints.length <= 3} onClick={deleteWallPoint}>Supprimer le point suivant</button></div></div>{selectedWall.layer === "existing" && <div className="lining-card"><div><span>Doublage intérieur</span><strong>{build.liningDepth} cm</strong></div><input type="range" min="3" max="30" value={build.liningDepth} onChange={(event) => setBuild((current) => ({ ...current, liningDepth: Number(event.target.value) }))} /><button type="button" onClick={regenerateLining}>Générer automatiquement le BA13</button><p>Le doublage est créé en retrait du bâti. Passe ensuite sur « Doublage BA13 » pour redresser ou supprimer les points inutiles.</p></div>}</> : <div className="empty-selection"><span>↖</span><strong>Sélectionne un mur</strong><p>Les cotes se modifient directement dans ce panneau.</p></div>}<div className="fixture-tools"><div><span>Éléments intégrés aux murs</span><small>Ils glissent uniquement le long du mur sélectionné.</small></div><button type="button" onClick={() => addFixture("door")}>＋ Porte</button><button type="button" onClick={() => addFixture("window")}>＋ Fenêtre</button></div>{selectedFixture && fixtureMeta[selectedFixture.kind].opening && <FixtureInspector fixture={selectedFixture} onChange={updateFixture} onDelete={deleteFixture} />}</div>}
 
-          {activeTab === "element" && <div className="panel-content" role="tabpanel">
-            {selected ? <><div className="panel-heading compact-heading"><span className="section-kicker">Élément sélectionné</span><input className="name-input" value={selected.name} aria-label="Nom de l’élément" onChange={(event) => updateSelected({ name: event.target.value })} /><p>{specs[selected.kind].label}</p></div><div className="dimension-grid"><NumberField label="Position X" value={selected.x} min={0} max={room.width - selected.w} onChange={(x) => updateSelected({ x })} /><NumberField label="Position Y" value={selected.y} min={0} max={room.depth - selected.h} onChange={(y) => updateSelected({ y })} /><NumberField label="Largeur plan" value={selected.w} min={10} max={room.width - selected.x} onChange={(w) => updateSelected({ w })} /><NumberField label="Profondeur plan" value={selected.h} min={10} max={room.depth - selected.y} onChange={(h) => updateSelected({ h })} />{(selected.kind === "door" || selected.kind === "window") && <NumberField label="Hauteur ouverture" value={selected.openingHeight ?? 110} min={20} max={room.height} onChange={(openingHeight) => updateSelected({ openingHeight })} />}</div><div className="button-grid"><button type="button" onClick={() => updateSelected({ w: selected.h, h: selected.w })}>↻ Pivoter 90°</button><button type="button" onClick={duplicateSelected}>＋ Dupliquer</button><button type="button" className="danger-action" onClick={removeSelected}>Supprimer</button></div><div className="item-requirements"><span className="section-kicker">Impact du calcul</span>{specs[selected.kind].electric && <p><i className="dot electric-dot" /> {specs[selected.kind].electric?.protection} · {specs[selected.kind].electric?.section}</p>}{specs[selected.kind].water?.cold && <p><i className="dot cold-dot" /> Conduite PER eau froide</p>}{specs[selected.kind].water?.hot && <p><i className="dot hot-dot" /> Conduite PER eau chaude</p>}{specs[selected.kind].water?.drain && <p><i className="dot drain-dot" /> Évacuation non chiffrée à ce stade</p>}{(selected.kind === "door" || selected.kind === "window") && <p>Déduit {(Math.max(selected.w, selected.h) / 100 * (selected.openingHeight ?? 110) / 100).toFixed(2)} m² de doublage.</p>}{selected.kind === "chimney" && <p>Obstacle conservé libre sur le plan.</p>}</div></> : <div className="room-editor"><div className="panel-heading compact-heading"><span className="section-kicker">Géométrie modifiable</span><h2>Dimensions de la pièce</h2><p>Tu peux saisir des valeurs approximatives maintenant et les corriger plus tard.</p></div><div className="dimension-grid"><NumberField label="Largeur" value={room.width} min={200} max={900} onChange={(width) => updateRoom({ width })} /><NumberField label="Profondeur" value={room.depth} min={200} max={900} onChange={(depth) => updateRoom({ depth })} /><NumberField label="Hauteur sous plafond" value={room.height} min={180} max={500} onChange={(height) => updateRoom({ height })} /></div><div className="room-metrics"><p><span>Sol</span><strong>{roomMetrics.floor.toFixed(2)} m²</strong></p><p><span>Murs bruts</span><strong>{roomMetrics.wallGross.toFixed(2)} m²</strong></p><p><span>Ouvertures déduites</span><strong>− {roomMetrics.openingArea.toFixed(2)} m²</strong></p><p><span>Murs nets</span><strong>{roomMetrics.wallNet.toFixed(2)} m²</strong></p></div><button type="button" className="primary-action wide-action" onClick={() => setActiveTab("catalog")}>Ajouter portes, fenêtres ou obstacle</button></div>}
-          </div>}
+          {mode === "layout" && <div className="inspector-content"><div className="panel-title"><span>02 · Aménagement</span><h2>Volumes dans la pièce</h2><p>Les murs techniques restent discrets pour laisser la priorité à l’agencement.</p></div><div className="object-catalog">{(Object.keys(objectMeta) as ObjectKind[]).map((kind) => <button type="button" key={kind} onClick={() => addObject(kind)}><i style={{ background: objectMeta[kind].color }} /><span>{objectMeta[kind].label}</span><b>＋</b></button>)}</div>{selectedObject ? <div className="selection-card"><span className="selection-label">Objet sélectionné</span><input className="name-field" value={selectedObject.name} onChange={(event) => updateObject({ name: event.target.value })} /><div className="field-grid"><NumberInput label="Position X" value={selectedObject.x} onChange={(x) => updateObject({ x })} /><NumberInput label="Position Y" value={selectedObject.y} onChange={(y) => updateObject({ y })} /><NumberInput label="Largeur" value={selectedObject.w} min={20} onChange={(w) => updateObject({ w })} /><NumberInput label="Profondeur" value={selectedObject.h} min={20} onChange={(h) => updateObject({ h })} /></div><div className="tool-grid"><button type="button" onClick={() => updateObject({ w: selectedObject.h, h: selectedObject.w })}>Pivoter 90°</button><button type="button" className="danger" onClick={() => { setObjects((current) => current.filter((object) => object.id !== selectedObject.id)); setSelectedObjectId(null); }}>Supprimer</button></div></div> : <div className="empty-selection compact"><span>↖</span><strong>Choisis ou sélectionne un volume</strong></div>}</div>}
 
-          {activeTab === "catalog" && <div className="panel-content" role="tabpanel"><div className="panel-heading compact-heading"><span className="section-kicker">Catalogue complet</span><h2>Ajouter au plan</h2><p>Les prises et sorties d’eau créent automatiquement leur tracé depuis le départ correspondant.</p></div><div className="catalog-groups">{catalogGroups.map(({ group, kinds }) => <section key={group}><h3>{group}</h3><div className="catalog-grid">{kinds.map((kind) => <button type="button" key={kind} onClick={() => addItem(kind)}><span className="catalog-swatch" style={{ background: specs[kind].color }} /><span><strong>{specs[kind].label}</strong><small>{specs[kind].defaultW} × {specs[kind].defaultH} cm</small></span><b>＋</b></button>)}</div></section>)}</div></div>}
+          {mode === "networks" && <div className="inspector-content"><div className="panel-title"><span>03 · Technique</span><h2>Un réseau à la fois</h2><p>Les points sont attachés aux murs ; les coudes restent déplaçables librement.</p></div><div className="network-switch">{(["electric", "cold", "hot"] as NetworkKind[]).map((kind) => <button type="button" key={kind} className={networkFilter === kind ? "active" : ""} onClick={() => { setNetworkFilter(kind); setSelectedRouteId(null); }}>{networkName(kind)}<strong>{routeTotals[kind].toFixed(1)} m</strong></button>)}</div><div className="network-actions">{networkFilter === "electric" ? <><button type="button" onClick={() => addFixture("source-electric")}>＋ Tableau</button><button type="button" onClick={() => addFixture("outlet")}>＋ Prise</button><button type="button" onClick={() => addFixture("switch")}>＋ Interrupteur</button><button type="button" onClick={() => addFixture("light")}>＋ Éclairage</button></> : networkFilter === "cold" ? <><button type="button" onClick={() => addFixture("source-cold")}>＋ Arrivée EF</button><button type="button" onClick={() => addFixture("water-cold")}>＋ Sortie EF</button></> : <><button type="button" onClick={() => addFixture("source-hot")}>＋ Départ EC</button><button type="button" onClick={() => addFixture("water-hot")}>＋ Sortie EC</button></>}<button type="button" className="wide" onClick={() => addFreeRoute(networkFilter)}>＋ Tracé libre vers une autre pièce</button></div>{selectedFixture && !fixtureMeta[selectedFixture.kind].opening && <FixtureInspector fixture={selectedFixture} onChange={updateFixture} onDelete={deleteFixture} />}{selectedRoute && <div className="selection-card route-card"><span className="selection-label">Tracé sélectionné</span><input className="name-field" value={selectedRoute.name} onChange={(event) => setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, name: event.target.value } : route))} /><p><strong>{routeLength(selectedRoute, fixtures, existing, lining).toFixed(2)} m</strong> avec marge de 15 %</p><div className="tool-grid"><button type="button" onClick={addRoutePoint}>＋ Ajouter un coude</button><button type="button" className="danger" onClick={() => { setRoutes((current) => current.filter((route) => route.id !== selectedRoute.id)); setSelectedRouteId(null); }}>Supprimer</button></div></div>}<div className="route-list">{routes.filter((route) => route.kind === networkFilter).map((route) => <button type="button" key={route.id} className={selectedRouteId === route.id ? "active" : ""} onClick={() => { setSelectedRouteId(route.id); clearSelection("route"); }}><span>{route.name}</span><strong>{routeLength(route, fixtures, existing, lining).toFixed(1)} m</strong></button>)}</div></div>}
 
-          {activeTab === "networks" && <div className="panel-content" role="tabpanel"><div className="panel-heading compact-heading"><span className="section-kicker">Tracés techniques</span><h2>Réseaux modifiables</h2><p>Sélectionne une ligne puis déplace ses poignées. Les extrémités liées suivent automatiquement les équipements.</p></div><div className="free-route-actions"><button type="button" onClick={() => addFreeRoute("electric")}>＋ Câble libre</button><button type="button" onClick={() => addFreeRoute("cold")}>＋ PER froid libre</button><button type="button" onClick={() => addFreeRoute("hot")}>＋ PER chaud libre</button></div>{selectedRoute && <div className={`route-inspector route-inspector-${selectedRoute.kind}`}><span className="section-kicker">Tracé sélectionné</span><input value={selectedRoute.name} aria-label="Nom du tracé" onChange={(event) => setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, name: event.target.value } : route))} /><p><strong>{routeLength(selectedRoute, items).toFixed(2)} m</strong> avec 15 % de marge · {selectedRoute.points.length} points</p><div><button type="button" onClick={addRoutePoint}>＋ Ajouter un coude</button><button type="button" disabled={selectedRoute.points.length <= 2} onClick={removeRoutePoint}>− Retirer un coude</button><button type="button" className="danger-action" onClick={() => { setRoutes((current) => current.filter((route) => route.id !== selectedRoute.id)); setSelectedRouteId(null); }}>Supprimer le tracé</button></div></div>}<div className="network-cards">{(["electric", "cold", "hot"] as NetworkKind[]).map((kind) => <button type="button" key={kind} className={`network-card ${kind}-card ${networks[kind] ? "active" : ""}`} onClick={() => setNetworks((current) => ({ ...current, [kind]: !current[kind] }))}><span>{networkLabel(kind)}</span><strong>{networkTotals[kind].toFixed(1)} m</strong><small>{routes.filter((route) => route.kind === kind).length} tracé(s)</small></button>)}</div><div className="route-list"><div className="circuit-heading"><span>Tracé</span><span>Longueur</span></div>{routes.map((route) => <button type="button" key={route.id} className={selectedRouteId === route.id ? "current" : ""} onClick={() => { setSelectedRouteId(route.id); setSelectedId(null); }}><span><i className={`dot ${route.kind}-dot`} /><strong>{route.name}</strong></span><b>{routeLength(route, items).toFixed(1)} m</b></button>)}</div><button type="button" className="rebuild-routes" onClick={() => { setRoutes(automaticRoutes(items)); setSelectedRouteId(null); setNotice("Tracés automatiques recalculés"); }}>Recalculer tous les raccordements automatiques</button><div className="technical-note"><strong>Repère de chantier</strong><p>Le calcul est un avant-métré. Les protections, sections, chutes de tension, évacuations et règles de pose restent à valider par un électricien et un plombier.</p></div></div>}
+          {mode === "budget" && <div className="inspector-content budget-content"><div className="panel-title"><span>04 · Métré</span><h2>Quantités d’achat</h2><p>Le besoin, le conditionnement et la quantité achetée sont séparés.</p></div><div className="budget-total"><span>Total produits</span><strong>{euros(grandTotal)}</strong><small>Prix enregistrés dans la bibliothèque</small></div><details className="settings-card"><summary>Paramètres de calcul</summary><div className="field-grid"><NumberInput label="Hauteur de pièce" value={build.roomHeight} onChange={(roomHeight) => setBuild((current) => ({ ...current, roomHeight }))} /><NumberInput label="Entraxe montants" value={build.studSpacing} onChange={(studSpacing) => setBuild((current) => ({ ...current, studSpacing }))} /><NumberInput label="Marge murs" value={build.waste} unit="%" onChange={(waste) => setBuild((current) => ({ ...current, waste }))} /><NumberInput label="Marge sol" value={build.tileWaste} unit="%" onChange={(tileWaste) => setBuild((current) => ({ ...current, tileWaste }))} /></div><label><input type="checkbox" checked={build.includeCeiling} onChange={(event) => setBuild((current) => ({ ...current, includeCeiling: event.target.checked }))} /> Inclure le plafond dans isolation et plaques</label></details><div className="purchase-list">{resolvedBudget.map((line) => <article key={line.key} className={line.remainder < -0.001 ? "insufficient" : ""}><header><div><strong>{line.label}</strong><small>{line.detail}</small></div><span>{line.required.toFixed(line.required < 10 ? 1 : 0)} {line.unit} requis</span></header><select value={line.product?.id ?? ""} onChange={(event) => setBudgetChoices((current) => ({ ...current, [line.key]: { ...current[line.key], productId: event.target.value, manualQuantity: undefined } }))}><option value="">Choisir un produit</option>{line.compatibles.map((product) => <option key={product.id} value={product.id}>{product.name} · {euros(product.price)}</option>)}</select>{line.product ? <div className="purchase-calc"><div><span>Conditionnement</span><strong>{line.product.coverage} {line.product.coverageUnit} / {line.product.packLabel}</strong></div><label><span>Quantité achetée</span><input type="number" min="0" value={line.quantity} onChange={(event) => setBudgetChoices((current) => ({ ...current, [line.key]: { productId: line.product?.id, manualQuantity: Math.max(0, event.currentTarget.valueAsNumber || 0) } }))} /></label><div><span>Couverture</span><strong>{line.purchased.toFixed(1)} {line.unit}</strong></div><div><span>{line.remainder >= 0 ? "Reste" : "Manque"}</span><strong>{Math.abs(line.remainder).toFixed(1)} {line.unit}</strong></div><b>{euros(line.total)}</b></div> : <p className="missing-product">Ajoute un produit compatible dans la bibliothèque.</p>}</article>)}</div></div>}
 
-          {activeTab === "budget" && <div className="panel-content budget-panel" role="tabpanel"><div className="panel-heading compact-heading"><span className="section-kicker">Métré & prix modifiables</span><h2>Estimation matériaux</h2><p>Les prix ci-dessous sont des exemples de départ. Modifie chaque prix unitaire selon ton magasin et ta gamme.</p></div><div className="budget-summary">{(["Plomberie", "Électricité", "Cloisons", "Carrelage"] as const).map((category) => <button type="button" key={category}><span>{category}</span><strong>{fmt(categoryTotals[category] ?? 0)}</strong></button>)}<div><span>Total matériaux</span><strong>{fmt(grandTotal)}</strong></div></div><details className="build-settings" open><summary>Paramètres du métré</summary><div className="dimension-grid"><NumberField label="Entraxe montants" value={build.studSpacing} min={30} max={100} onChange={(studSpacing) => setBuild((current) => ({ ...current, studSpacing }))} /><NumberField label="Longueur montants" value={build.studLength} min={200} max={400} onChange={(studLength) => setBuild((current) => ({ ...current, studLength }))} /><NumberField label="Marge cloisons" value={build.waste} min={0} max={30} unit="%" onChange={(waste) => setBuild((current) => ({ ...current, waste }))} /><NumberField label="Marge carrelage" value={build.tileWaste} min={0} max={30} unit="%" onChange={(tileWaste) => setBuild((current) => ({ ...current, tileWaste }))} /></div><label className="ceiling-toggle"><input type="checkbox" checked={build.includeCeiling} onChange={(event) => setBuild((current) => ({ ...current, includeCeiling: event.target.checked }))} /> Inclure le plafond dans isolation et BA13</label></details>{(["Plomberie", "Électricité", "Cloisons", "Carrelage"] as const).map((category) => <section className="material-section" key={category}><h3><span>{category}</span><strong>{fmt(categoryTotals[category] ?? 0)}</strong></h3><div className="material-table">{materials.filter((line) => line.category === category).map((line) => <div className="material-row" key={line.priceKey}><div><strong>{line.label}</strong><small>{line.detail}</small></div><span className="material-qty">{line.qty < 10 && line.unit !== "u" ? line.qty.toFixed(1) : Math.ceil(line.qty)} {line.unit}</span><label><input type="number" min="0" step="0.1" value={prices[line.priceKey]} aria-label={`Prix ${line.label}`} onChange={(event) => { const value = event.currentTarget.valueAsNumber; if (Number.isFinite(value)) setPrices((current) => ({ ...current, [line.priceKey]: value })); }} /><small>€/{line.unit}</small></label><b>{fmt(line.qty * prices[line.priceKey])}</b></div>)}</div></section>)}</div>}
-
-          {activeTab === "saves" && <div className="panel-content" role="tabpanel"><div className="panel-heading compact-heading"><span className="section-kicker">Configurations locales</span><h2>Sauvegarder plusieurs plans</h2><p>Chaque sauvegarde conserve le plan, les tracés, les prix et les paramètres de travaux dans ce navigateur.</p></div><label className="save-name-field"><span>Nom de la configuration</span><input value={configName} onChange={(event) => setConfigName(event.target.value)} placeholder="Ex. Version cotes provisoires" /></label><div className="save-actions"><button type="button" className="primary-action" onClick={saveNewConfiguration}>Enregistrer une copie</button>{currentConfigId && <button type="button" onClick={updateCurrentConfiguration}>Mettre à jour</button>}</div><div className="saved-list"><div className="saved-list-heading"><span>Mes plans</span><strong>{savedConfigs.length}</strong></div>{savedConfigs.length ? savedConfigs.map((configuration) => <article key={configuration.id} className={currentConfigId === configuration.id ? "current" : ""}><button type="button" className="load-save" onClick={() => loadConfiguration(configuration)}><span><strong>{configuration.name}</strong><small>{configuration.items.length} éléments · {new Date(configuration.updatedAt).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })}</small></span><b>Ouvrir</b></button><button type="button" className="delete-save" aria-label={`Supprimer ${configuration.name}`} onClick={() => deleteConfiguration(configuration.id)}>×</button></article>) : <div className="empty-saves"><p>Aucune configuration nommée.</p><small>Le plan courant est conservé comme brouillon automatique.</small></div>}</div></div>}
+          {mode === "products" && <div className="inspector-content product-content"><div className="panel-title"><span>05 · Bibliothèque</span><h2>Produits & conditionnements</h2><p>Catalogue personnel réutilisable dans tous les projets. Les prix restent datés et modifiables.</p></div><div className="import-actions"><button type="button" onClick={() => fileRef.current?.click()}>Importer un CSV</button><input ref={fileRef} hidden type="file" accept=".csv,text/csv" onChange={importProducts} /><small>Colonnes : nom; référence; catégorie; magasin; prix; couverture; unité; conditionnement; URL</small></div><details className="add-product" open><summary>Ajouter un produit</summary><input placeholder="Nom du produit" value={newProduct.name} onChange={(event) => setNewProduct((current) => ({ ...current, name: event.target.value }))} /><div className="field-grid"><label><span>Catégorie</span><select value={newProduct.category} onChange={(event) => setNewProduct((current) => ({ ...current, category: event.target.value as ProductCategory }))}>{(["plomberie", "electricite", "ossature", "isolation", "plaques", "carrelage", "consommables"] as ProductCategory[]).map((category) => <option key={category} value={category}>{category}</option>)}</select></label><label><span>Magasin</span><input value={newProduct.store} onChange={(event) => setNewProduct((current) => ({ ...current, store: event.target.value }))} /></label><NumberInput label="Prix du conditionnement" value={newProduct.price} unit="€" step={0.1} onChange={(price) => setNewProduct((current) => ({ ...current, price }))} /><NumberInput label="Couverture" value={newProduct.coverage} unit={newProduct.coverageUnit} step={0.1} onChange={(coverage) => setNewProduct((current) => ({ ...current, coverage }))} /></div><input placeholder="Référence / EAN" value={newProduct.reference} onChange={(event) => setNewProduct((current) => ({ ...current, reference: event.target.value }))} /><input placeholder="Lien vers la fiche produit" value={newProduct.url} onChange={(event) => setNewProduct((current) => ({ ...current, url: event.target.value }))} /><button type="button" className="primary" onClick={addProduct}>Ajouter à la bibliothèque</button></details><div className="product-list">{products.map((product) => <article key={product.id}><div className="product-head"><div><span>{product.store || "Sans magasin"}</span><strong>{product.name}</strong><small>{product.reference || "Sans référence"}</small></div>{product.url && <a href={product.url} target="_blank" rel="noreferrer">Fiche ↗</a>}</div><div className="product-fields"><NumberInput label="Prix" value={product.price} unit="€" step={0.1} onChange={(price) => updateProduct(product.id, { price, checkedAt: new Date().toISOString().slice(0, 10) })} /><NumberInput label={`Couverture / ${product.packLabel}`} value={product.coverage} unit={product.coverageUnit} step={0.1} onChange={(coverage) => updateProduct(product.id, { coverage })} /></div><footer><span>{product.category}</span><small>Prix vérifié le {formatDate(product.checkedAt)}</small><button type="button" onClick={() => setProducts((current) => current.filter((entry) => entry.id !== product.id))}>Supprimer</button></footer></article>)}</div></div>}
         </aside>
       </section>
-
-      <section className="help-band"><div><span className="section-kicker">Calcul en cascade</span><h2>Une modification du plan met tout le chantier à jour.</h2></div><ol><li><span>01</span><p><strong>Pièce & ouvertures</strong>Les portes et fenêtres sont déduites des murs.</p></li><li><span>02</span><p><strong>Réseaux libres</strong>Ajoute des coudes ou une attente vers une autre pièce.</p></li><li><span>03</span><p><strong>Métré complet</strong>PER, câbles, rails, montants, isolation, BA13 et carrelage.</p></li><li><span>04</span><p><strong>Prix personnalisés</strong>Chaque quantité et chaque prix restent modifiables.</p></li></ol></section>
     </main>
   );
+}
+
+function FixtureInspector({ fixture, onChange, onDelete }: { fixture: WallFixture; onChange: (changes: Partial<WallFixture>) => void; onDelete: () => void }) {
+  return <div className="selection-card fixture-card"><span className="selection-label">Élément mural sélectionné</span><input className="name-field" value={fixture.name} onChange={(event) => onChange({ name: event.target.value })} /><div className="field-grid"><NumberInput label="Distance sur le mur" value={fixture.offset * 100} unit="%" min={0} max={100} onChange={(offset) => onChange({ offset: offset / 100 })} /><NumberInput label="Largeur" value={fixture.width} onChange={(width) => onChange({ width })} /><NumberInput label="Hauteur" value={fixture.height} onChange={(height) => onChange({ height })} /><NumberInput label="Hauteur de pose" value={fixture.mountHeight} onChange={(mountHeight) => onChange({ mountHeight })} /><NumberInput label="Quantité groupée" value={fixture.quantity} unit="u" min={1} step={1} onChange={(quantity) => onChange({ quantity: Math.max(1, Math.round(quantity)) })} /></div><button type="button" className="danger wide-danger" onClick={onDelete}>Supprimer l’élément</button></div>;
 }

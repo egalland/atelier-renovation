@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Configurateur cuisine d'Emmanuel",
-  description: "Éditeur de cuisine et rénovation avec plan ajustable, réseaux manuels, métré et budget matériaux.",
+  title: "Atelier Rénovation",
+  description: "Éditeur de plans irréguliers, doublages, réseaux techniques, métrés et achats de rénovation.",
   other: {
     "codex-preview": "development",
   },
