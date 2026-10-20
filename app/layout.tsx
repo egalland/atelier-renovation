@@ -3,7 +3,7 @@ import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Configurateur cuisine d'Emmanuel",
-  description: "Configurateur interactif pour une cuisine avec péninsule.",
+  description: "Éditeur interactif de cuisine avec drag-and-drop, plans nommés et simulation des réseaux.",
   other: {
     "codex-preview": "development",
   },
