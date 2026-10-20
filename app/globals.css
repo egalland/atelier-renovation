@@ -91,11 +91,18 @@ button { color: inherit; }
 .main-workspace { padding: 0 clamp(16px, 2.5vw, 36px) 34px; display: grid; grid-template-columns: minmax(0, 1fr) 390px; gap: 12px; align-items: start; }
 .canvas-panel, .inspector-panel { border: 1px solid var(--line); border-radius: 16px; background: rgba(17,24,39,.82); box-shadow: 0 20px 70px rgba(0,0,0,.2); }
 .canvas-panel { overflow: hidden; }
-.canvas-toolbar { min-height: 48px; padding: 8px 12px; display: flex; justify-content: space-between; gap: 16px; align-items: center; border-bottom: 1px solid var(--line); }
+.canvas-toolbar { min-height: 48px; padding: 8px 12px; display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--line); }
 .canvas-toolbar > div { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .canvas-toolbar label { display: flex; gap: 5px; align-items: center; color: var(--muted); font-size: .6rem; }
 .canvas-toolbar input { accent-color: var(--blue); }
 .canvas-toolbar button { padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: .59rem; }
+.canvas-toolbar button:hover { border-color: #3b82f6; background: rgba(59,130,246,.08); color: white; }
+.canvas-navigation { margin-left: auto; padding: 3px; gap: 3px !important; flex-wrap: nowrap !important; border: 1px solid var(--line); border-radius: 10px; background: rgba(8,13,24,.64); box-shadow: inset 0 1px rgba(255,255,255,.03); }
+.canvas-navigation button { min-height: 28px; border-color: transparent; background: transparent; color: #cbd5e1; }
+.canvas-navigation .zoom-button { width: 30px; padding: 0; font-size: .9rem; font-weight: 850; }
+.canvas-navigation output { min-width: 43px; color: #93c5fd; text-align: center; font-size: .56rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.canvas-navigation .fit-button, .canvas-navigation .fullscreen-button { padding-inline: 9px; border-left-color: var(--line); border-radius: 6px; }
+.canvas-navigation .fullscreen-button { color: #a5f3fc; }
 .layer-legend span { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: .59rem; }
 .layer-legend i { width: 19px; height: 3px; border-radius: 4px; }
 .legend-existing { background: #334155; }
@@ -104,9 +111,10 @@ button { color: inherit; }
 .legend-cold { background: var(--cold); }
 .legend-hot { background: var(--hot); }
 
-.drawing-stage { padding: 10px; background: #e9eef6; }
+.drawing-stage { min-height: 0; padding: 10px; background: #e9eef6; }
 .drawing-stage svg { width: 100%; max-height: calc(100vh - 238px); min-height: 590px; display: block; touch-action: none; user-select: none; }
-.canvas-bg { fill: #f7f9fc; }
+.canvas-bg { fill: #f7f9fc; cursor: grab; }
+.drawing-stage svg.is-panning, .drawing-stage svg.is-panning .canvas-bg { cursor: grabbing; }
 #cad-grid path { stroke: #d9e1ed; stroke-width: .45; }
 .room-fill { fill: rgba(219,227,239,.48); stroke: none; }
 .wall-hit { stroke: transparent; stroke-width: 22; cursor: pointer; }
@@ -162,6 +170,12 @@ button { color: inherit; }
 .canvas-footer { min-height: 45px; padding: 8px 14px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; align-items: center; border-top: 1px solid var(--line); }
 .canvas-footer span { color: var(--muted); font-size: .57rem; }
 .canvas-footer b { color: var(--text); font-size: .65rem; }
+
+.canvas-panel:fullscreen { width: 100vw; height: 100vh; display: flex; flex-direction: column; border: 0; border-radius: 0; background: #0b1220; }
+.canvas-panel:fullscreen .canvas-toolbar { flex: 0 0 auto; background: #0b1220; }
+.canvas-panel:fullscreen .drawing-stage { flex: 1 1 auto; display: flex; padding: 12px; overflow: hidden; }
+.canvas-panel:fullscreen .drawing-stage svg { width: 100%; height: 100%; min-height: 0; max-height: none; }
+.canvas-panel:fullscreen .canvas-footer { flex: 0 0 auto; background: #0b1220; }
 
 .inspector-panel { position: sticky; top: 94px; max-height: calc(100vh - 112px); overflow: auto; scrollbar-color: #334155 transparent; }
 .inspector-content { padding: 20px; }
@@ -327,6 +341,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
   .quick-metrics { display: none; }
   .main-workspace { padding: 0 10px 20px; }
   .canvas-toolbar { align-items: flex-start; flex-direction: column; }
+  .canvas-navigation { width: 100%; margin-left: 0; justify-content: center; overflow-x: auto; }
   .drawing-stage { padding: 3px; }
   .drawing-stage svg { min-height: 420px; }
   .canvas-footer { grid-template-columns: 1fr 1fr; }

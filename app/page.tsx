@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -15,6 +16,8 @@ type NetworkKind = "electric" | "cold" | "hot";
 type Point = { x: number; y: number };
 type RoutePoint = Point & { wallIndex?: number; wallOffset?: number; wallLayer?: Layer };
 type SelectedWall = { layer: Layer; index: number };
+type ViewBox = { x: number; y: number; width: number; height: number };
+type PanState = { pointerId: number; startClient: Point; origin: ViewBox; scaleX: number; scaleY: number };
 
 type FixtureKind = "door" | "window" | "outlet" | "switch" | "light" | "water-cold" | "water-hot" | "source-electric" | "source-cold" | "source-hot";
 type WallFixture = {
@@ -278,7 +281,9 @@ function NumberInput({ label, value, unit = "cm", min = 0, max = 9999, step = 1,
 
 export default function Home() {
   const svgRef = useRef<SVGSVGElement>(null);
+  const canvasPanelRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
+  const panRef = useRef<PanState | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const [mode, setMode] = useState<Mode>("plan");
   const [existing, setExisting] = useState<Point[]>(defaultExisting);
@@ -303,6 +308,9 @@ export default function Home() {
   const [savedProjects, setSavedProjects] = useState<SavedProject[]>([]);
   const [notice, setNotice] = useState("Toutes les modifications sont enregistrées localement");
   const [hydrated, setHydrated] = useState(false);
+  const [viewport, setViewport] = useState<ViewBox | null>(null);
+  const [isPanning, setIsPanning] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [newProduct, setNewProduct] = useState<Omit<Product, "id">>({ name: "", reference: "", category: "consommables", store: "", url: "", price: 0, coverage: 1, coverageUnit: "u", packLabel: "unité", checkedAt: new Date().toISOString().slice(0, 10) });
 
   const selectedFixture = fixtures.find((fixture) => fixture.id === selectedFixtureId) ?? null;
@@ -317,6 +325,29 @@ export default function Home() {
     const maxX = Math.max(600, ...finite.map((point) => point.x)); const maxY = Math.max(550, ...finite.map((point) => point.y)); const padding = 55;
     return { x: minX - padding, y: minY - padding, width: Math.max(710, maxX - minX + padding * 2), height: Math.max(660, maxY - minY + padding * 2) };
   }, [existing, lining, objects, routes, fixtures]);
+  const activeView = viewport ?? bounds;
+  const zoomPercent = Math.round(bounds.width / activeView.width * 100);
+  const pointFromEvent = useCallback((event: { clientX: number; clientY: number }) => {
+    const svg = svgRef.current; const matrix = svg?.getScreenCTM(); if (!svg || !matrix) return null;
+    const point = svg.createSVGPoint(); point.x = event.clientX; point.y = event.clientY; return point.matrixTransform(matrix.inverse());
+  }, []);
+  const zoomView = useCallback((factor: number, anchor?: Point) => {
+    setViewport((current) => {
+      const view = current ?? bounds;
+      const minWidth = bounds.width / 8;
+      const maxWidth = bounds.width * 4;
+      const nextWidth = clamp(view.width * factor, minWidth, maxWidth);
+      const appliedFactor = nextWidth / view.width;
+      if (Math.abs(appliedFactor - 1) < 0.0001) return view;
+      const focus = anchor ?? { x: view.x + view.width / 2, y: view.y + view.height / 2 };
+      return {
+        x: focus.x - (focus.x - view.x) * appliedFactor,
+        y: focus.y - (focus.y - view.y) * appliedFactor,
+        width: nextWidth,
+        height: view.height * appliedFactor,
+      };
+    });
+  }, [bounds]);
 
   const routeTotals = useMemo(() => ({
     electric: routes.filter((route) => route.kind === "electric").reduce((sum, route) => sum + routeLength(route, fixtures, existing, lining), 0),
@@ -378,6 +409,8 @@ export default function Home() {
       const draft = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? "null");
       if (draft?.existing?.length >= 3) {
         const restoredBuild = { ...defaultBuild, ...(draft.build ?? {}) };
+        // Browser-only draft hydration intentionally restores the related state atomically here.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setExisting(copyPoints(draft.existing)); setLining(copyPoints(draft.lining?.length >= 3 ? draft.lining : createLining(draft.existing, restoredBuild)));
         setFixtures(copyFixtures(draft.fixtures ?? [])); setObjects(copyObjects(draft.objects ?? [])); setRoutes(copyRoutes(draft.routes ?? []));
         setBuild(restoredBuild); setBudgetChoices(draft.budgetChoices ?? {}); setProjectName(draft.projectName ?? "Projet rénovation");
@@ -403,10 +436,50 @@ export default function Home() {
     window.addEventListener("pointermove", followPointer, { passive: true });
     return () => { cancelAnimationFrame(frame); window.removeEventListener("pointermove", followPointer); };
   }, []);
+  useEffect(() => {
+    const syncFullscreen = () => setIsFullscreen(document.fullscreenElement === canvasPanelRef.current);
+    document.addEventListener("fullscreenchange", syncFullscreen);
+    return () => document.removeEventListener("fullscreenchange", syncFullscreen);
+  }, []);
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    const handleNativeWheel = (event: globalThis.WheelEvent) => {
+      event.preventDefault();
+      const anchor = pointFromEvent(event);
+      zoomView(event.deltaY < 0 ? 0.88 : 1.14, anchor ?? undefined);
+    };
+    svg.addEventListener("wheel", handleNativeWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", handleNativeWheel);
+  }, [pointFromEvent, zoomView]);
 
-  function pointFromEvent(event: { clientX: number; clientY: number }) {
-    const svg = svgRef.current; const matrix = svg?.getScreenCTM(); if (!svg || !matrix) return null;
-    const point = svg.createSVGPoint(); point.x = event.clientX; point.y = event.clientY; return point.matrixTransform(matrix.inverse());
+  function beginCanvasPan(event: ReactPointerEvent<SVGRectElement>) {
+    if (event.button !== 0) return;
+    const svg = svgRef.current;
+    const matrix = svg?.getScreenCTM();
+    if (!svg || !matrix) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const view = { ...activeView };
+    panRef.current = {
+      pointerId: event.pointerId,
+      startClient: { x: event.clientX, y: event.clientY },
+      origin: view,
+      scaleX: Math.abs(matrix.a) || 1,
+      scaleY: Math.abs(matrix.d) || Math.abs(matrix.a) || 1,
+    };
+    setViewport(view);
+    setIsPanning(true);
+    clearSelection();
+  }
+  async function toggleFullscreen() {
+    try {
+      if (document.fullscreenElement === canvasPanelRef.current) await document.exitFullscreen();
+      else await canvasPanelRef.current?.requestFullscreen();
+    } catch {
+      setNotice("Le plein écran n’est pas disponible dans ce navigateur");
+    }
   }
   function clearSelection(except?: "wall" | "fixture" | "object" | "route") {
     if (except !== "wall") setSelectedWall(null); if (except !== "fixture") setSelectedFixtureId(null); if (except !== "object") setSelectedObjectId(null); if (except !== "route") setSelectedRouteId(null);
@@ -437,6 +510,13 @@ export default function Home() {
   }
 
   function onPointerMove(event: ReactPointerEvent<SVGSVGElement>) {
+    const pan = panRef.current;
+    if (pan) {
+      const dx = (event.clientX - pan.startClient.x) / pan.scaleX;
+      const dy = (event.clientY - pan.startClient.y) / pan.scaleY;
+      setViewport({ ...pan.origin, x: pan.origin.x - dx, y: pan.origin.y - dy });
+      return;
+    }
     const pointer = pointFromEvent(event); const drag = dragRef.current; if (!pointer || !drag) return;
     if (drag.type === "wall-point") setPoints(drag.layer, (points) => points.map((point, index) => index === drag.index ? snapPoint(pointer, points, index) : point));
     if (drag.type === "fixture") setFixtures((current) => current.map((fixture) => {
@@ -458,7 +538,12 @@ export default function Home() {
       return { x: round(drag.origin.x + pointer.x - drag.start.x), y: round(drag.origin.y + pointer.y - drag.start.y) };
     }) } : route));
   }
-  function endDrag() { if (dragRef.current) setNotice("Modification enregistrée"); dragRef.current = null; }
+  function endDrag() {
+    if (dragRef.current) setNotice("Modification enregistrée");
+    dragRef.current = null;
+    panRef.current = null;
+    setIsPanning(false);
+  }
 
   function beginPointDrag(event: ReactPointerEvent<SVGCircleElement>, layer: Layer, index: number) { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "wall-point", layer, index }; setSelectedWall({ layer, index: Math.max(0, index - 1) }); clearSelection("wall"); }
   function beginFixtureDrag(event: ReactPointerEvent<SVGGElement>, fixture: WallFixture) { event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "fixture", id: fixture.id }; setSelectedFixtureId(fixture.id); clearSelection("fixture"); }
@@ -521,10 +606,10 @@ export default function Home() {
     if (!window.confirm("Créer un nouveau plan ? Le brouillon actuel sera remplacé, mais tes configurations sauvegardées et ta bibliothèque de produits resteront disponibles.")) return;
     const nextExisting = copyPoints(defaultExisting); const nextBuild = { ...defaultBuild }; const nextLining = createLining(nextExisting, nextBuild); const nextFixtures = copyFixtures(defaultFixtures);
     setProjectName("Nouveau projet"); setExisting(nextExisting); setBuild(nextBuild); setLining(nextLining); setFixtures(nextFixtures); setObjects(copyObjects(defaultObjects)); setRoutes(automaticRoutes(nextFixtures, nextExisting, nextLining)); setBudgetChoices({});
-    setElementSnap(true); setShowPrices(false); setMode("plan"); setSelectedWall({ layer: "existing", index: 0 }); setSelectedFixtureId(null); setSelectedObjectId(null); setSelectedRouteId(null); setRouteWallWaypointMode(false); setNotice("Nouveau plan créé — les sauvegardes et produits sont conservés");
+    setElementSnap(true); setShowPrices(false); setViewport(null); setMode("plan"); setSelectedWall({ layer: "existing", index: 0 }); setSelectedFixtureId(null); setSelectedObjectId(null); setSelectedRouteId(null); setRouteWallWaypointMode(false); setNotice("Nouveau plan créé — les sauvegardes et produits sont conservés");
   }
   function saveProject() { const name = projectName.trim() || "Projet sans nom"; const saved: SavedProject = { id: uid(), name, updatedAt: new Date().toISOString(), existing: copyPoints(existing), lining: copyPoints(lining), fixtures: copyFixtures(fixtures), objects: copyObjects(objects), routes: copyRoutes(routes), build: { ...build }, budgetChoices: { ...budgetChoices }, elementSnap, showPrices }; setSavedProjects((current) => [saved, ...current]); setNotice(`« ${name} » sauvegardé`); }
-  function loadProject(project: SavedProject) { setProjectName(project.name); setExisting(copyPoints(project.existing)); setLining(copyPoints(project.lining)); setFixtures(copyFixtures(project.fixtures)); setObjects(copyObjects(project.objects)); setRoutes(copyRoutes(project.routes)); setBuild({ ...defaultBuild, ...project.build }); setBudgetChoices({ ...project.budgetChoices }); setElementSnap(project.elementSnap ?? true); setShowPrices(project.showPrices ?? false); setRouteWallWaypointMode(false); setNotice(`« ${project.name} » chargé`); }
+  function loadProject(project: SavedProject) { setProjectName(project.name); setExisting(copyPoints(project.existing)); setLining(copyPoints(project.lining)); setFixtures(copyFixtures(project.fixtures)); setObjects(copyObjects(project.objects)); setRoutes(copyRoutes(project.routes)); setBuild({ ...defaultBuild, ...project.build }); setBudgetChoices({ ...project.budgetChoices }); setElementSnap(project.elementSnap ?? true); setShowPrices(project.showPrices ?? false); setViewport(null); setRouteWallWaypointMode(false); setNotice(`« ${project.name} » chargé`); }
 
   function addProduct() { if (!newProduct.name.trim()) return; setProducts((current) => [{ ...newProduct, id: uid() }, ...current]); setNewProduct((current) => ({ ...current, name: "", reference: "", price: 0 })); setNotice("Produit ajouté à la bibliothèque"); }
   function updateProduct(id: string, changes: Partial<Product>) { setProducts((current) => current.map((product) => product.id === id ? { ...product, ...changes } : product)); }
@@ -545,17 +630,24 @@ export default function Home() {
       <section className="context-bar"><div><span className={`mode-dot mode-dot-${mode}`} /> <strong>{mode === "plan" ? "Structure du bâti" : mode === "layout" ? "Volumes et aménagement" : mode === "networks" ? `${networkName(networkFilter)} uniquement` : mode === "budget" ? "Métré et achats" : "Bibliothèque de produits"}</strong><small>{notice}</small></div><div className="quick-metrics"><span><b>{metrics.floor.toFixed(1)}</b> m² au sol</span><span><b>{metrics.wallNet.toFixed(1)}</b> m² de murs nets</span><span><b>{euros(renovationTotal)}</b> estimés</span></div></section>
 
       <section className={`main-workspace mode-${mode}`}>
-        <div className="canvas-panel">
+        <div ref={canvasPanelRef} className="canvas-panel">
           <div className="canvas-toolbar">
             <div className="layer-legend"><span><i className="legend-existing" />Mur existant</span><span><i className="legend-lining" />Doublage BA13</span>{mode === "networks" && <span><i className={`legend-${networkFilter}`} />{networkName(networkFilter)}</span>}</div>
             <div><label><input type="checkbox" checked={showDimensions} onChange={(event) => setShowDimensions(event.target.checked)} /> Cotes</label><label><input type="checkbox" checked={showPrices} onChange={(event) => setShowPrices(event.target.checked)} /> Prix</label>{mode === "plan" ? <label><input type="checkbox" checked={orthogonalSnap} onChange={(event) => setOrthogonalSnap(event.target.checked)} /> Aimant murs 90°</label> : <label><input type="checkbox" checked={elementSnap} onChange={(event) => setElementSnap(event.target.checked)} /> Aimant éléments 5 cm</label>}<button type="button" onClick={() => window.print()}>Imprimer</button></div>
+            <div className="canvas-navigation" aria-label="Navigation du plan">
+              <button type="button" className="zoom-button" aria-label="Dézoomer" title="Dézoomer" onClick={() => zoomView(1.2)}>−</button>
+              <output aria-label="Niveau de zoom">{zoomPercent}%</output>
+              <button type="button" className="zoom-button" aria-label="Zoomer" title="Zoomer" onClick={() => zoomView(1 / 1.2)}>＋</button>
+              <button type="button" className="fit-button" title="Recadrer toute la pièce" onClick={() => setViewport(null)}>Vue globale</button>
+              <button type="button" className="fullscreen-button" title={isFullscreen ? "Quitter le plein écran" : "Afficher le plan en plein écran"} onClick={toggleFullscreen}>{isFullscreen ? "Retour" : "Plein écran"}</button>
+            </div>
           </div>
 
           <div className="drawing-stage">
-            <svg ref={svgRef} className={routeWallWaypointMode ? "waypoint-mode" : ""} viewBox={`${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}`} role="img" aria-label="Plan interactif de rénovation" onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
+            <svg ref={svgRef} className={`${routeWallWaypointMode ? "waypoint-mode" : ""} ${isPanning ? "is-panning" : ""}`} viewBox={`${activeView.x} ${activeView.y} ${activeView.width} ${activeView.height}`} role="img" aria-label="Plan interactif de rénovation. Utilisez la molette pour zoomer et faites glisser le fond pour vous déplacer." onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
               <defs><pattern id="cad-grid" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M10 0H0V10" fill="none" /></pattern><filter id="soft-shadow"><feDropShadow dx="0" dy="3" stdDeviation="3" floodOpacity=".16" /></filter></defs>
-              <rect x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} className="canvas-bg" onPointerDown={() => clearSelection()} />
-              <rect x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} fill="url(#cad-grid)" pointerEvents="none" />
+              <rect x={activeView.x} y={activeView.y} width={activeView.width} height={activeView.height} className="canvas-bg" onPointerDown={beginCanvasPan} />
+              <rect x={activeView.x} y={activeView.y} width={activeView.width} height={activeView.height} fill="url(#cad-grid)" pointerEvents="none" />
               <path d={wallPath(existing)} className="room-fill" pointerEvents="none" />
 
               {existing.map((_, index) => { const wall = segment(existing, index); const selected = selectedWall?.layer === "existing" && selectedWall.index === index; return <g key={`existing-${index}`}><line className="wall-hit" x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedWall({ layer: "existing", index }); clearSelection("wall"); }} /><line className={`wall-line existing-wall ${selected ? "selected" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" />{showDimensions && <g className="wall-dimension" transform={`translate(${(wall.a.x + wall.b.x) / 2},${(wall.a.y + wall.b.y) / 2})`}><rect x="-23" y="-9" width="46" height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{Math.round(segmentLength(existing, index))} cm</text></g>}</g>; })}
