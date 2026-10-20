@@ -97,11 +97,13 @@ button { color: inherit; }
 .canvas-toolbar input { accent-color: var(--blue); }
 .canvas-toolbar button { padding: 6px 9px; border: 1px solid var(--line); border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; font-size: .59rem; }
 .canvas-toolbar button:hover { border-color: #3b82f6; background: rgba(59,130,246,.08); color: white; }
+.editor-shortcuts { color: #64748b; font-size: .52rem; white-space: nowrap; }
 .canvas-navigation { margin-left: auto; padding: 3px; gap: 3px !important; flex-wrap: nowrap !important; border: 1px solid var(--line); border-radius: 10px; background: rgba(8,13,24,.64); box-shadow: inset 0 1px rgba(255,255,255,.03); }
 .canvas-navigation button { min-height: 28px; border-color: transparent; background: transparent; color: #cbd5e1; }
 .canvas-navigation .zoom-button { width: 30px; padding: 0; font-size: .9rem; font-weight: 850; }
 .canvas-navigation output { min-width: 43px; color: #93c5fd; text-align: center; font-size: .56rem; font-weight: 800; font-variant-numeric: tabular-nums; }
 .canvas-navigation .fit-button, .canvas-navigation .fullscreen-button { padding-inline: 9px; border-left-color: var(--line); border-radius: 6px; }
+.canvas-navigation .fit-button { width: 30px; padding: 0; font-size: .82rem; line-height: 1; }
 .canvas-navigation .fullscreen-button { color: #a5f3fc; }
 .layer-legend span { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: .59rem; }
 .layer-legend i { width: 19px; height: 3px; border-radius: 4px; }
@@ -134,6 +136,7 @@ button { color: inherit; }
 .wall-dimension text { fill: white; font-size: 8px; font-weight: 700; }
 
 .wall-fixture { cursor: ew-resize; outline: none; }
+.wall-fixture.free-fixture { cursor: move; }
 .opening-fixture line { stroke-width: 10; stroke-linecap: butt; paint-order: stroke; filter: drop-shadow(0 1px 1px rgba(15,23,42,.22)); }
 .opening-fixture text { fill: #334155; font-size: 8px; font-weight: 700; paint-order: stroke; stroke: #f7f9fc; stroke-width: 3px; pointer-events: none; }
 .wall-fixture.selected line { stroke-width: 14; }
@@ -152,7 +155,14 @@ button { color: inherit; }
 .plan-object .object-size { fill: rgba(255,255,255,.72); font-size: 7px; font-weight: 600; }
 .plan-object.ghost { opacity: .22; cursor: pointer; }
 .plan-object.network-connected > rect:first-child { stroke: #22d3ee; stroke-width: 2.5; filter: drop-shadow(0 0 5px rgba(34,211,238,.28)); }
-.resize-handle { fill: white !important; stroke: #111827 !important; stroke-width: 2 !important; cursor: nwse-resize; }
+.object-resize-zones { opacity: 0; transition: opacity 120ms ease; }
+.plan-object:hover .object-resize-zones, .plan-object.selected .object-resize-zones { opacity: 1; }
+.resize-zone { fill: transparent; stroke: transparent; stroke-width: 1.5; pointer-events: all; transition: fill 100ms ease, stroke 100ms ease; }
+.resize-zone:hover { fill: rgba(96,165,250,.24); stroke: #60a5fa; }
+.resize-zone.edge-n, .resize-zone.edge-s { cursor: ns-resize; }
+.resize-zone.edge-e, .resize-zone.edge-w { cursor: ew-resize; }
+.resize-zone.corner-nw, .resize-zone.corner-se { cursor: nwse-resize; }
+.resize-zone.corner-ne, .resize-zone.corner-sw { cursor: nesw-resize; }
 .object-network-port circle { fill: #0f172a; stroke: white; stroke-width: 2; filter: url(#soft-shadow); }
 .object-network-port text { fill: white; stroke: none; font-size: 6px; font-weight: 900; pointer-events: none; }
 .object-network-port.port-electric circle { fill: var(--amber); }
@@ -169,6 +179,7 @@ button { color: inherit; }
 .route-handles .movable { cursor: move; }
 .route-handles .anchored { fill: #111827; }
 .route-handles .wall-waypoint { fill: #0f172a; stroke-width: 4; cursor: move; filter: drop-shadow(0 0 5px rgba(34,211,238,.72)); }
+.route-handles circle.selected { stroke-width: 5; filter: drop-shadow(0 0 7px rgba(37,99,235,.82)); }
 .handles-electric circle { stroke: var(--amber); }
 .handles-cold circle { stroke: var(--cold); }
 .handles-hot circle { stroke: var(--hot); }
@@ -182,6 +193,22 @@ button { color: inherit; }
 .canvas-panel:fullscreen .drawing-stage { flex: 1 1 auto; display: flex; padding: 12px; overflow: hidden; }
 .canvas-panel:fullscreen .drawing-stage svg { width: 100%; height: 100%; min-height: 0; max-height: none; }
 .canvas-panel:fullscreen .canvas-footer { flex: 0 0 auto; background: #0b1220; }
+
+.context-menu { position: fixed; z-index: 1000; width: min(234px, calc(100vw - 24px)); padding: 7px; border: 1px solid rgba(148,163,184,.28); border-radius: 12px; background: rgba(10,16,28,.97); color: #e5edf8; box-shadow: 0 22px 60px rgba(0,0,0,.48), inset 0 1px rgba(255,255,255,.05); backdrop-filter: blur(18px); animation: context-menu-in 110ms ease-out; }
+@keyframes context-menu-in { from { opacity: 0; transform: translateY(-4px) scale(.985); } }
+.context-menu-title { min-width: 0; padding: 7px 9px 9px; display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.context-menu-title span { overflow: hidden; font-size: .64rem; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.context-menu-title small { flex: 0 0 auto; color: #64748b; font-size: .48rem; }
+.context-menu button { width: 100%; min-height: 34px; padding: 7px 8px; display: grid; grid-template-columns: 21px minmax(0,1fr) auto; gap: 5px; align-items: center; border: 0; border-radius: 7px; background: transparent; color: #cbd5e1; text-align: left; cursor: pointer; font: inherit; font-size: .57rem; }
+.context-menu button:hover { background: rgba(59,130,246,.13); color: white; }
+.context-menu button:disabled { opacity: .42; cursor: not-allowed; }
+.context-menu button:disabled:hover { background: transparent; }
+.context-menu button i { display: grid; place-items: center; width: 21px; height: 21px; border-radius: 5px; background: rgba(148,163,184,.1); color: #93c5fd; font-style: normal; font-size: .65rem; }
+.context-menu button kbd { padding: 2px 4px; border: 1px solid rgba(148,163,184,.18); border-radius: 4px; background: rgba(15,23,42,.7); color: #64748b; font-family: inherit; font-size: .43rem; }
+.context-menu button.danger { color: #fda4af; }
+.context-menu button.danger i { background: rgba(244,63,94,.1); color: #fb7185; }
+.context-menu-separator { height: 1px; margin: 5px 7px; background: rgba(148,163,184,.16); }
+.context-menu-help { margin: 5px 7px 2px; padding-top: 7px; border-top: 1px solid rgba(148,163,184,.1); color: #64748b; font-size: .43rem; line-height: 1.4; }
 
 .inspector-panel { position: sticky; top: 94px; max-height: calc(100vh - 112px); overflow: auto; scrollbar-color: #334155 transparent; }
 .inspector-content { padding: 20px; }
