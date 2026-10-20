@@ -16,6 +16,9 @@ type Mode = "plan" | "layout" | "networks" | "budget" | "products";
 type Layer = "existing" | "lining";
 type NetworkKind = "electric" | "cold" | "hot";
 type Point = { x: number; y: number };
+type Measurement = { id: string; points: Point[] };
+type DimensionVisibility = { existing: boolean; lining: boolean; layout: boolean; networks: boolean; measurements: boolean };
+type DimensionLabelPlacement = Point & { width: number };
 type RoutePoint = Point & { wallIndex?: number; wallOffset?: number; wallLayer?: Layer };
 type SelectedWall = { layer: Layer; index: number };
 type ViewBox = { x: number; y: number; width: number; height: number };
@@ -27,6 +30,7 @@ type ContextTarget =
   | { type: "fixture"; id: string }
   | { type: "route"; id: string }
   | { type: "route-point"; routeId: string; pointIndex: number }
+  | { type: "measurement"; id: string }
   | { type: "wall"; layer: Layer; index: number; point: Point };
 type ContextMenuState = { x: number; y: number; target: ContextTarget };
 
@@ -78,8 +82,11 @@ type SavedProject = {
   fixtures: WallFixture[];
   objects: PlanObject[];
   routes: NetworkRoute[];
+  measurements?: Measurement[];
   build: BuildSettings;
   budgetChoices: Record<string, BudgetChoice>;
+  dimensionVisibility?: DimensionVisibility;
+  measurementSnap?: boolean;
   elementSnap?: boolean;
   showPrices?: boolean;
   showAllNetworks?: boolean;
@@ -90,7 +97,8 @@ type DragState =
   | { type: "fixture"; id: string }
   | { type: "object"; id: string; start: Point; origin: Point }
   | { type: "resize-object"; id: string; edge: ResizeEdge; start: Point; origin: { x: number; y: number; w: number; h: number } }
-  | { type: "route-point"; routeId: string; pointIndex: number; start: Point; origin: Point };
+  | { type: "route-point"; routeId: string; pointIndex: number; start: Point; origin: Point }
+  | { type: "measurement-point"; measurementId: string; pointIndex: number };
 
 const DRAFT_KEY = "atelier-renovation-draft-v1";
 const PRODUCTS_KEY = "atelier-renovation-products-v1";
@@ -117,6 +125,7 @@ const copyPoints = <T extends Point>(points: T[]): T[] => points.map((point) => 
 const copyFixtures = (fixtures: WallFixture[]) => fixtures.map((fixture) => ({ ...fixture, freePosition: fixture.freePosition ? { ...fixture.freePosition } : undefined }));
 const copyObjects = (objects: PlanObject[]) => objects.map((object) => ({ ...object, connections: object.connections ? [...object.connections] : undefined }));
 const copyRoutes = (routes: NetworkRoute[]) => routes.map((route) => ({ ...route, points: copyPoints(route.points) }));
+const copyMeasurements = (measurements: Measurement[]) => measurements.map((measurement) => ({ ...measurement, points: copyPoints(measurement.points) }));
 
 const defaultExisting: Point[] = [
   { x: 0, y: 0 }, { x: 200, y: 0 }, { x: 200, y: 50 }, { x: 380, y: 50 },
@@ -124,6 +133,7 @@ const defaultExisting: Point[] = [
 ];
 
 const defaultBuild: BuildSettings = { roomHeight: 250, liningDepth: 8, rightAngleTolerance: 10, autoSquareLining: true, studSpacing: 60, waste: 10, tileWaste: 10, includeCeiling: false };
+const defaultDimensionVisibility: DimensionVisibility = { existing: true, lining: true, layout: false, networks: false, measurements: true };
 
 const fixtureMeta: Record<FixtureKind, { label: string; short: string; color: string; network?: NetworkKind; source?: NetworkKind; opening?: boolean }> = {
   door: { label: "Porte", short: "P", color: "#64748b", opening: true },
@@ -213,6 +223,50 @@ function projectOnSegment(point: Point, points: Point[], index: number) {
 }
 function nearestWallProjection(point: Point, points: Point[]) {
   return points.reduce((best, _, index) => { const candidate = projectOnSegment(point, points, index); return !best || candidate.distance < best.distance ? candidate : best; }, null as ReturnType<typeof projectOnSegment> | null);
+}
+
+function polylineLength(points: Point[]) {
+  return points.slice(1).reduce((sum, point, index) => sum + Math.hypot(point.x - points[index].x, point.y - points[index].y), 0);
+}
+function polylineMidpoint(points: Point[]) {
+  if (!points.length) return { x: 0, y: 0 };
+  const total = polylineLength(points); if (total < 0.001) return { ...points[0] };
+  const target = total / 2; let travelled = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1]; const current = points[index]; const length = Math.hypot(current.x - previous.x, current.y - previous.y);
+    if (travelled + length >= target) { const ratio = (target - travelled) / Math.max(length, 0.001); return { x: previous.x + (current.x - previous.x) * ratio, y: previous.y + (current.y - previous.y) * ratio }; }
+    travelled += length;
+  }
+  return { ...points.at(-1)! };
+}
+function measurementSummary(points: Point[]) {
+  if (points.length < 2) return "Point de départ";
+  const total = Math.round(polylineLength(points));
+  if (points.length === 2) return `${total} cm · X ${Math.round(Math.abs(points[1].x - points[0].x))} · Y ${Math.round(Math.abs(points[1].y - points[0].y))}`;
+  return `Total ${total} cm · ${points.length - 1} segments`;
+}
+function dimensionBoxesOverlap(a: { x: number; y: number; width: number; height: number }, b: { x: number; y: number; width: number; height: number }) {
+  const gap = 5;
+  return Math.abs(a.x - b.x) < (a.width + b.width) / 2 + gap && Math.abs(a.y - b.y) < (a.height + b.height) / 2 + gap;
+}
+function wallDimensionPlacements(points: Point[], side: "inside" | "outside", occupied: { x: number; y: number; width: number; height: number }[]) {
+  const orientation = signedArea(points) >= 0 ? 1 : -1;
+  return points.map((_, index) => {
+    const wall = segment(points, index); const dx = wall.b.x - wall.a.x; const dy = wall.b.y - wall.a.y; const length = Math.hypot(dx, dy) || 1;
+    const tangent = { x: dx / length, y: dy / length }; const inward = { x: -tangent.y * orientation, y: tangent.x * orientation }; const direction = side === "inside" ? 1 : -1;
+    const midpoint = { x: (wall.a.x + wall.b.x) / 2, y: (wall.a.y + wall.b.y) / 2 }; const text = `${Math.round(length)} cm`; const width = Math.max(46, text.length * 4.6 + 14);
+    let placement: DimensionLabelPlacement = { ...midpoint, width };
+    const candidates = [20, 34, 48].flatMap((offset) => [0, 18, -18, 36, -36].map((shift) => ({ x: midpoint.x + inward.x * offset * direction + tangent.x * shift, y: midpoint.y + inward.y * offset * direction + tangent.y * shift, width })));
+    const free = candidates.find((candidate) => !occupied.some((box) => dimensionBoxesOverlap({ ...candidate, height: 18 }, box)));
+    placement = free ?? candidates.at(-1)!;
+    occupied.push({ ...placement, height: 18 });
+    return placement;
+  });
+}
+function placeFloatingDimension(point: Point, width: number, occupied: { x: number; y: number; width: number; height: number }[]) {
+  const candidates = [0, -22, 22, -44, 44, -66, 66].map((offset) => ({ x: point.x, y: point.y + offset, width, height: 18 }));
+  const placement = candidates.find((candidate) => !occupied.some((box) => dimensionBoxesOverlap(candidate, box))) ?? candidates.at(-1)!;
+  occupied.push(placement); return placement;
 }
 
 function lineIntersection(p: Point, r: Point, q: Point, s: Point) {
@@ -398,6 +452,11 @@ export default function Home() {
   const [fixtures, setFixtures] = useState<WallFixture[]>(defaultFixtures);
   const [objects, setObjects] = useState<PlanObject[]>(defaultObjects);
   const [routes, setRoutes] = useState<NetworkRoute[]>(() => automaticRoutes(defaultFixtures, defaultObjects, defaultExisting, createLining(defaultExisting, defaultBuild)));
+  const [measurements, setMeasurements] = useState<Measurement[]>([]);
+  const [measurementDraft, setMeasurementDraft] = useState<Point[]>([]);
+  const [measurementPreview, setMeasurementPreview] = useState<Point | null>(null);
+  const [measureMode, setMeasureMode] = useState(false);
+  const [measurementSnap, setMeasurementSnap] = useState(true);
   const [products, setProducts] = useState<Product[]>(defaultProducts);
   const [budgetChoices, setBudgetChoices] = useState<Record<string, BudgetChoice>>({});
   const [selectedWall, setSelectedWall] = useState<SelectedWall | null>({ layer: "existing", index: 0 });
@@ -405,13 +464,14 @@ export default function Home() {
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
   const [selectedRoutePoint, setSelectedRoutePoint] = useState<{ routeId: string; pointIndex: number } | null>(null);
+  const [selectedMeasurementId, setSelectedMeasurementId] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [networkFilter, setNetworkFilter] = useState<NetworkKind>("electric");
   const [showAllNetworks, setShowAllNetworks] = useState(false);
   const [routeWallWaypointMode, setRouteWallWaypointMode] = useState(false);
   const [orthogonalSnap, setOrthogonalSnap] = useState(true);
   const [elementSnap, setElementSnap] = useState(true);
-  const [showDimensions, setShowDimensions] = useState(true);
+  const [dimensionVisibility, setDimensionVisibility] = useState<DimensionVisibility>(defaultDimensionVisibility);
   const [showPrices, setShowPrices] = useState(false);
   const [projectName, setProjectName] = useState("Projet rénovation");
   const [savedProjects, setSavedProjects] = useState<SavedProject[]>([]);
@@ -428,14 +488,31 @@ export default function Home() {
   const selectedObject = objects.find((object) => object.id === selectedObjectId) ?? null;
   const selectedRoute = routes.find((route) => route.id === selectedRouteId) ?? null;
   const layerPoints = selectedWall?.layer === "lining" ? lining : existing;
+  const visibleRoutes = useMemo(() => routes.filter((route) => showAllNetworks || route.kind === networkFilter), [routes, showAllNetworks, networkFilter]);
+  const wallDimensionLayout = useMemo(() => {
+    const occupied: { x: number; y: number; width: number; height: number }[] = [];
+    return { existing: wallDimensionPlacements(existing, "outside", occupied), lining: wallDimensionPlacements(lining, "inside", occupied) };
+  }, [existing, lining]);
+  const networkDimensionLayout = useMemo(() => {
+    const occupied: { x: number; y: number; width: number; height: number }[] = [];
+    return new Map(visibleRoutes.map((route) => {
+      const points = effectiveRoutePoints(route, fixtures, objects, existing, lining); const text = `${routeLength(route, fixtures, objects, existing, lining).toFixed(1)} m`; const width = Math.max(46, text.length * 4.6 + 14);
+      return [route.id, { ...placeFloatingDimension(polylineMidpoint(points), width, occupied), text }] as const;
+    }));
+  }, [visibleRoutes, fixtures, objects, existing, lining]);
+  const measurementDisplayPoints = useMemo(() => {
+    if (!measurementDraft.length || !measurementPreview) return measurementDraft;
+    const last = measurementDraft.at(-1)!; return Math.hypot(last.x - measurementPreview.x, last.y - measurementPreview.y) < 0.1 ? measurementDraft : [...measurementDraft, measurementPreview];
+  }, [measurementDraft, measurementPreview]);
+  const activeDimensionCount = Object.values(dimensionVisibility).filter(Boolean).length;
 
   const bounds = useMemo(() => {
-    const all = [...existing, ...lining, ...fixtures.map((fixture) => fixturePosition(fixture, existing, lining)), ...objects.flatMap((object) => [{ x: object.x, y: object.y }, { x: object.x + object.w, y: object.y + object.h }]), ...routes.flatMap((route) => effectiveRoutePoints(route, fixtures, objects, existing, lining))];
+    const all = [...existing, ...lining, ...fixtures.map((fixture) => fixturePosition(fixture, existing, lining)), ...objects.flatMap((object) => [{ x: object.x, y: object.y }, { x: object.x + object.w, y: object.y + object.h }]), ...routes.flatMap((route) => effectiveRoutePoints(route, fixtures, objects, existing, lining)), ...measurements.flatMap((measurement) => measurement.points)];
     const finite = all.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
     const minX = Math.min(0, ...finite.map((point) => point.x)); const minY = Math.min(0, ...finite.map((point) => point.y));
     const maxX = Math.max(600, ...finite.map((point) => point.x)); const maxY = Math.max(550, ...finite.map((point) => point.y)); const padding = 120;
     return { x: minX - padding, y: minY - padding, width: Math.max(770, maxX - minX + padding * 2), height: Math.max(740, maxY - minY + padding * 2) };
-  }, [existing, lining, objects, routes, fixtures]);
+  }, [existing, lining, objects, routes, fixtures, measurements]);
   const fittedBounds = useMemo(() => fitViewBoxToAspect(bounds, canvasAspect), [bounds, canvasAspect]);
   const activeView = useMemo(() => fitViewBoxToAspect(viewport ?? bounds, canvasAspect), [viewport, bounds, canvasAspect]);
   const zoomPercent = Math.round(fittedBounds.width / activeView.width * 100);
@@ -528,16 +605,16 @@ export default function Home() {
         // Browser-only draft hydration intentionally restores the related state atomically here.
         // eslint-disable-next-line react-hooks/set-state-in-effect
         setExisting(restoredExisting); setLining(restoredLining);
-        setFixtures(restoredFixtures); setObjects(copyObjects(draft.objects ?? [])); setRoutes(copyRoutes(draft.routes ?? []));
+        setFixtures(restoredFixtures); setObjects(copyObjects(draft.objects ?? [])); setRoutes(copyRoutes(draft.routes ?? [])); setMeasurements(copyMeasurements(draft.measurements ?? []));
         setBuild(restoredBuild); setBudgetChoices(draft.budgetChoices ?? {}); setProjectName(draft.projectName ?? "Projet rénovation");
-        setElementSnap(draft.elementSnap ?? true); setShowPrices(draft.showPrices ?? false); setShowAllNetworks(draft.showAllNetworks ?? false);
+        setElementSnap(draft.elementSnap ?? true); setShowPrices(draft.showPrices ?? false); setShowAllNetworks(draft.showAllNetworks ?? false); setMeasurementSnap(draft.measurementSnap ?? true); setDimensionVisibility({ ...defaultDimensionVisibility, ...(draft.dimensionVisibility ?? {}) });
       }
       const storedProducts = JSON.parse(localStorage.getItem(PRODUCTS_KEY) ?? "null"); if (Array.isArray(storedProducts)) setProducts(storedProducts);
       const saves = JSON.parse(localStorage.getItem(SAVES_KEY) ?? "[]"); if (Array.isArray(saves)) setSavedProjects(saves);
     } catch { setNotice("Le brouillon précédent était illisible ; un nouveau projet a été ouvert."); }
     setHydrated(true);
   }, []);
-  useEffect(() => { if (hydrated) localStorage.setItem(DRAFT_KEY, JSON.stringify({ projectName, existing, lining, fixtures, objects, routes, build, budgetChoices, elementSnap, showPrices, showAllNetworks })); }, [hydrated, projectName, existing, lining, fixtures, objects, routes, build, budgetChoices, elementSnap, showPrices, showAllNetworks]);
+  useEffect(() => { if (hydrated) localStorage.setItem(DRAFT_KEY, JSON.stringify({ projectName, existing, lining, fixtures, objects, routes, measurements, build, budgetChoices, elementSnap, showPrices, showAllNetworks, measurementSnap, dimensionVisibility })); }, [hydrated, projectName, existing, lining, fixtures, objects, routes, measurements, build, budgetChoices, elementSnap, showPrices, showAllNetworks, measurementSnap, dimensionVisibility]);
   useEffect(() => { if (hydrated) localStorage.setItem(PRODUCTS_KEY, JSON.stringify(products)); }, [hydrated, products]);
   useEffect(() => { if (hydrated) localStorage.setItem(SAVES_KEY, JSON.stringify(savedProjects)); }, [hydrated, savedProjects]);
   useEffect(() => {
@@ -588,7 +665,7 @@ export default function Home() {
   }, [pointFromEvent, zoomView]);
 
   function beginCanvasPan(event: ReactPointerEvent<SVGRectElement>) {
-    if (event.button !== 0) return;
+    if (event.button !== 0 || measureMode) return;
     const svg = svgRef.current;
     const matrix = svg?.getScreenCTM();
     if (!svg || !matrix) return;
@@ -615,8 +692,8 @@ export default function Home() {
       setNotice("Le plein écran n’est pas disponible dans ce navigateur");
     }
   }
-  function clearSelection(except?: "wall" | "fixture" | "object" | "route" | "route-point") {
-    if (except !== "wall") setSelectedWall(null); if (except !== "fixture") setSelectedFixtureId(null); if (except !== "object") setSelectedObjectId(null); if (except !== "route" && except !== "route-point") setSelectedRouteId(null); if (except !== "route-point") setSelectedRoutePoint(null);
+  function clearSelection(except?: "wall" | "fixture" | "object" | "route" | "route-point" | "measurement") {
+    if (except !== "wall") setSelectedWall(null); if (except !== "fixture") setSelectedFixtureId(null); if (except !== "object") setSelectedObjectId(null); if (except !== "route" && except !== "route-point") setSelectedRouteId(null); if (except !== "route-point") setSelectedRoutePoint(null); if (except !== "measurement") setSelectedMeasurementId(null);
   }
   function setPoints(layer: Layer, updater: (points: Point[]) => Point[]) { if (layer === "existing") setExisting((current) => updater(current)); else setLining((current) => updater(current)); }
   function snapPoint(point: Point, points: Point[], index: number) {
@@ -650,6 +727,45 @@ export default function Home() {
     return { x: round(nearestGuide(gridX, xCandidates)), y: round(nearestGuide(gridY, yCandidates)) };
   }
 
+  function snapMeasurementPoint(raw: Point) {
+    if (!measurementSnap) return { x: round(raw.x), y: round(raw.y) };
+    const candidates: Point[] = [...existing, ...lining, ...fixtures.map((fixture) => fixturePosition(fixture, existing, lining)), ...routes.flatMap((route) => effectiveRoutePoints(route, fixtures, objects, existing, lining))];
+    [existing, lining].forEach((points) => { const projection = nearestWallProjection(raw, points); if (projection) candidates.push(projection.point); });
+    objects.forEach((object) => {
+      const left = object.x; const right = object.x + object.w; const top = object.y; const bottom = object.y + object.h; const centerX = object.x + object.w / 2; const centerY = object.y + object.h / 2;
+      candidates.push({ x: left, y: top }, { x: right, y: top }, { x: right, y: bottom }, { x: left, y: bottom }, { x: centerX, y: centerY }, { x: clamp(raw.x, left, right), y: top }, { x: clamp(raw.x, left, right), y: bottom }, { x: left, y: clamp(raw.y, top, bottom) }, { x: right, y: clamp(raw.y, top, bottom) });
+    });
+    const nearest = candidates.reduce((best, point) => { const distance = Math.hypot(raw.x - point.x, raw.y - point.y); return !best || distance < best.distance ? { point, distance } : best; }, null as { point: Point; distance: number } | null);
+    if (nearest && nearest.distance <= 12) return { x: round(nearest.point.x), y: round(nearest.point.y) };
+    return { x: Math.round(raw.x / 5) * 5, y: Math.round(raw.y / 5) * 5 };
+  }
+  function startMeasurement(point?: Point) {
+    setMeasureMode(true); setMeasurementDraft(point ? [snapMeasurementPoint(point)] : []); setMeasurementPreview(null); setContextMenu(null); clearSelection(); setNotice(point ? "Point de départ placé — ajoute un ou plusieurs points, puis Entrée" : "Clique le point de départ de la mesure");
+  }
+  function cancelMeasurement() { setMeasureMode(false); setMeasurementDraft([]); setMeasurementPreview(null); setNotice("Mesure annulée"); }
+  function finishMeasurement() {
+    if (measurementDraft.length < 2) { setNotice("Place au moins deux points pour enregistrer la mesure"); return; }
+    const measurement: Measurement = { id: `measure-${uid()}`, points: copyPoints(measurementDraft) };
+    setMeasurements((current) => [...current, measurement]); setSelectedMeasurementId(measurement.id); setDimensionVisibility((current) => ({ ...current, measurements: true })); setMeasureMode(false); setMeasurementDraft([]); setMeasurementPreview(null); clearSelection("measurement"); setNotice(`Mesure enregistrée · ${measurementSummary(measurement.points)}`);
+  }
+  function deleteMeasurement(measurementId: string) { setMeasurements((current) => current.filter((measurement) => measurement.id !== measurementId)); if (selectedMeasurementId === measurementId) setSelectedMeasurementId(null); setNotice("Mesure supprimée"); }
+  function handleMeasurementPointerDown(event: ReactPointerEvent<SVGSVGElement>) {
+    if (!measureMode || event.button !== 0) return;
+    const pointer = pointFromEvent(event); if (!pointer) return;
+    event.preventDefault(); event.stopPropagation(); const point = snapMeasurementPoint(pointer);
+    setMeasurementDraft((current) => { const last = current.at(-1); return last && Math.hypot(last.x - point.x, last.y - point.y) < 0.1 ? current : [...current, point]; });
+    setMeasurementPreview(point); setNotice(measurementDraft.length ? "Point ajouté — Entrée pour terminer, Échap pour annuler" : "Déplace la souris puis clique le point suivant");
+  }
+  function contextTargetPoint(target: ContextTarget): Point | null {
+    if (target.type === "plan" || target.type === "wall") return { ...target.point };
+    if (target.type === "object") { const object = objects.find((entry) => entry.id === target.id); return object ? objectCenter(object) : null; }
+    if (target.type === "fixture") { const fixture = fixtures.find((entry) => entry.id === target.id); return fixture ? fixturePosition(fixture, existing, lining) : null; }
+    if (target.type === "route") { const route = routes.find((entry) => entry.id === target.id); return route ? polylineMidpoint(effectiveRoutePoints(route, fixtures, objects, existing, lining)) : null; }
+    if (target.type === "route-point") { const route = routes.find((entry) => entry.id === target.routeId); return route ? effectiveRouteHandles(route, fixtures, objects, existing, lining).find((handle) => handle.storedIndex === target.pointIndex)?.point ?? null : null; }
+    if (target.type === "measurement") { const measurement = measurements.find((entry) => entry.id === target.id); return measurement ? polylineMidpoint(measurement.points) : null; }
+    return null;
+  }
+
   function onPointerMove(event: ReactPointerEvent<SVGSVGElement>) {
     const pan = panRef.current;
     if (pan) {
@@ -658,7 +774,7 @@ export default function Home() {
       setViewport({ ...pan.origin, x: pan.origin.x - dx, y: pan.origin.y - dy });
       return;
     }
-    const pointer = pointFromEvent(event); const drag = dragRef.current; if (!pointer || !drag) return;
+    const pointer = pointFromEvent(event); if (measureMode && pointer && measurementDraft.length) setMeasurementPreview(snapMeasurementPoint(pointer)); const drag = dragRef.current; if (!pointer || !drag) return;
     if (drag.type === "wall-point") setPoints(drag.layer, (points) => points.map((point, index) => index === drag.index ? snapPoint(pointer, points, index) : point));
     if (drag.type === "fixture") setFixtures((current) => current.map((fixture) => {
       if (fixture.id !== drag.id) return fixture;
@@ -684,6 +800,7 @@ export default function Home() {
       const nearest = nearestWallProjection(pointer, lining);
       return nearest ? { x: nearest.point.x, y: nearest.point.y, wallIndex: nearest.wallIndex, wallOffset: nearest.wallOffset, wallLayer: "lining" } : point;
     }) } : route));
+    if (drag.type === "measurement-point") setMeasurements((current) => current.map((measurement) => measurement.id === drag.measurementId ? { ...measurement, points: measurement.points.map((point, index) => index === drag.pointIndex ? snapMeasurementPoint(pointer) : point) } : measurement));
   }
   function endDrag() {
     if (dragRef.current) setNotice("Modification enregistrée");
@@ -696,6 +813,7 @@ export default function Home() {
   function beginFixtureDrag(event: ReactPointerEvent<SVGGElement>, fixture: WallFixture) { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "fixture", id: fixture.id }; setSelectedFixtureId(fixture.id); clearSelection("fixture"); }
   function beginObjectDrag(event: ReactPointerEvent<SVGGElement>, object: PlanObject) { if (event.button !== 0) return; const pointer = pointFromEvent(event); if (!pointer) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "object", id: object.id, start: pointer, origin: { x: object.x, y: object.y } }; setSelectedObjectId(object.id); clearSelection("object"); }
   function beginObjectResize(event: ReactPointerEvent<SVGRectElement>, object: PlanObject, edge: ResizeEdge) { if (event.button !== 0) return; const pointer = pointFromEvent(event); if (!pointer) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "resize-object", id: object.id, edge, start: pointer, origin: { x: object.x, y: object.y, w: object.w, h: object.h } }; setSelectedObjectId(object.id); clearSelection("object"); }
+  function beginMeasurementPointDrag(event: ReactPointerEvent<SVGCircleElement>, measurementId: string, pointIndex: number) { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "measurement-point", measurementId, pointIndex }; setSelectedMeasurementId(measurementId); clearSelection("measurement"); }
 
   function updateSelectedWallLength(length: number) {
     if (!selectedWall) return; setPoints(selectedWall.layer, (points) => { const next = copyPoints(points); const { a, b } = segment(points, selectedWall.index); const angle = Math.atan2(b.y - a.y, b.x - a.x); next[(selectedWall.index + 1) % points.length] = { x: round(a.x + Math.cos(angle) * length), y: round(a.y + Math.sin(angle) * length) }; return next; });
@@ -748,7 +866,7 @@ export default function Home() {
   function dropObjectLayer(event: ReactDragEvent<HTMLDivElement>, targetId: string) { event.preventDefault(); const draggedId = draggedObjectId ?? event.dataTransfer.getData("text/plain"); if (draggedId) reorderObjectLayers(draggedId, targetId); setDraggedObjectId(null); }
   function deleteRoute(routeId: string) { setRoutes((current) => current.filter((route) => route.id !== routeId)); if (selectedRouteId === routeId) setSelectedRouteId(null); setSelectedRoutePoint(null); setRouteWallWaypointMode(false); }
   function deleteRoutePoint(routeId: string, pointIndex: number) { const route = routes.find((entry) => entry.id === routeId); if (!route || pointIndex <= 0 || pointIndex >= route.points.length - 1) { setNotice("Ce point d’extrémité ne peut pas être supprimé seul"); return; } setRoutes((current) => current.map((entry) => entry.id === routeId ? { ...entry, points: entry.points.filter((_, index) => index !== pointIndex) } : entry)); setSelectedRoutePoint(null); setNotice("Nœud supprimé"); }
-  function openContextMenu(event: ReactMouseEvent, target: ContextTarget) { event.preventDefault(); event.stopPropagation(); setContextMenu({ x: clamp(event.clientX, 12, Math.max(12, window.innerWidth - 246)), y: clamp(event.clientY, 12, Math.max(12, window.innerHeight - 390)), target }); if (target.type === "object") { setSelectedObjectId(target.id); clearSelection("object"); } if (target.type === "fixture") { setSelectedFixtureId(target.id); clearSelection("fixture"); } if (target.type === "route") { setSelectedRouteId(target.id); clearSelection("route"); } if (target.type === "route-point") { setSelectedRouteId(target.routeId); setSelectedRoutePoint({ routeId: target.routeId, pointIndex: target.pointIndex }); clearSelection("route-point"); } if (target.type === "wall") { setSelectedWall({ layer: target.layer, index: target.index }); clearSelection("wall"); } }
+  function openContextMenu(event: ReactMouseEvent, target: ContextTarget) { event.preventDefault(); event.stopPropagation(); setContextMenu({ x: clamp(event.clientX, 12, Math.max(12, window.innerWidth - 246)), y: clamp(event.clientY, 12, Math.max(12, window.innerHeight - 430)), target }); if (target.type === "object") { setSelectedObjectId(target.id); clearSelection("object"); } if (target.type === "fixture") { setSelectedFixtureId(target.id); clearSelection("fixture"); } if (target.type === "route") { setSelectedRouteId(target.id); clearSelection("route"); } if (target.type === "route-point") { setSelectedRouteId(target.routeId); setSelectedRoutePoint({ routeId: target.routeId, pointIndex: target.pointIndex }); clearSelection("route-point"); } if (target.type === "measurement") { setSelectedMeasurementId(target.id); clearSelection("measurement"); } if (target.type === "wall") { setSelectedWall({ layer: target.layer, index: target.index }); clearSelection("wall"); } }
   function openPlanContextMenu(event: ReactMouseEvent<SVGSVGElement>) { const point = pointFromEvent(event); if (point) openContextMenu(event, { type: "plan", point }); }
   function addWallPointAt(target: Extract<ContextTarget, { type: "wall" }>) { setPoints(target.layer, (points) => { const next = copyPoints(points); next.splice(target.index + 1, 0, { ...target.point }); return next; }); setSelectedWall({ layer: target.layer, index: target.index }); setContextMenu(null); setNotice("Point ajouté à l’endroit choisi"); }
   function addRouteWaypointAt(target: Extract<ContextTarget, { type: "wall" }>) { if (!selectedRoute || target.layer !== "lining") return; const projected = projectOnSegment(target.point, lining, target.index); const waypoint: RoutePoint = { ...projected.point, wallIndex: target.index, wallOffset: projected.wallOffset, wallLayer: "lining" }; setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, points: [...route.points.slice(0, -1), waypoint, route.points.at(-1)!] } : route)); setRouteWallWaypointMode(false); setNotice(`Passage imposé sur le mur BA13 ${target.index + 1}`); }
@@ -757,7 +875,9 @@ export default function Home() {
   useEffect(() => {
     const handleKeyboard = (event: KeyboardEvent) => {
       const element = event.target as HTMLElement | null; const editing = element?.matches("input, textarea, select, [contenteditable='true']"); if (editing) return;
-      if (event.key === "Escape") { setContextMenu(null); setRouteWallWaypointMode(false); setSelectedRoutePoint(null); return; }
+      if (event.key === "Escape") { setContextMenu(null); setRouteWallWaypointMode(false); setSelectedRoutePoint(null); if (measureMode) { setMeasureMode(false); setMeasurementDraft([]); setMeasurementPreview(null); setNotice("Mesure annulée"); } return; }
+      if ((event.key === "m" || event.key === "M") && !event.ctrlKey && !event.metaKey) { event.preventDefault(); if (measureMode) { setMeasureMode(false); setMeasurementDraft([]); setMeasurementPreview(null); setNotice("Outil de mesure quitté"); } else { setMeasureMode(true); setMeasurementDraft([]); setMeasurementPreview(null); clearSelection(); setNotice("Clique le point de départ de la mesure"); } return; }
+      if (event.key === "Enter" && measureMode) { event.preventDefault(); if (measurementDraft.length >= 2) { const measurement: Measurement = { id: `measure-${uid()}`, points: copyPoints(measurementDraft) }; setMeasurements((current) => [...current, measurement]); setSelectedMeasurementId(measurement.id); setDimensionVisibility((current) => ({ ...current, measurements: true })); setMeasureMode(false); setMeasurementDraft([]); setMeasurementPreview(null); clearSelection("measurement"); setNotice(`Mesure enregistrée · ${measurementSummary(measurement.points)}`); } else setNotice("Place au moins deux points pour enregistrer la mesure"); return; }
       if (event.key === "0") { event.preventDefault(); setViewport(null); return; }
       if (event.key === "+" || event.key === "=") { event.preventDefault(); zoomView(1 / 1.2); return; }
       if (event.key === "-") { event.preventDefault(); zoomView(1.2); return; }
@@ -770,6 +890,7 @@ export default function Home() {
       }
       if (event.key !== "Delete") return;
       event.preventDefault();
+      if (selectedMeasurementId) { setMeasurements((current) => current.filter((measurement) => measurement.id !== selectedMeasurementId)); setSelectedMeasurementId(null); setNotice("Mesure supprimée"); return; }
       if (selectedRoutePoint) { const route = routes.find((entry) => entry.id === selectedRoutePoint.routeId); if (route && selectedRoutePoint.pointIndex > 0 && selectedRoutePoint.pointIndex < route.points.length - 1) { setRoutes((current) => current.map((entry) => entry.id === route.id ? { ...entry, points: entry.points.filter((_, index) => index !== selectedRoutePoint.pointIndex) } : entry)); setSelectedRoutePoint(null); } return; }
       if (selectedObjectId) { const next = objects.filter((object) => object.id !== selectedObjectId); setObjects(next); setRoutes((current) => mergeAutomaticRoutes(current.filter((route) => route.targetObjectId !== selectedObjectId), automaticRoutes(fixtures, next, existing, lining))); setSelectedObjectId(null); return; }
       if (selectedFixtureId) { const next = fixtures.filter((fixture) => fixture.id !== selectedFixtureId); setFixtures(next); setRoutes((current) => mergeAutomaticRoutes(current.filter((route) => route.sourceFixtureId !== selectedFixtureId && route.targetFixtureId !== selectedFixtureId), automaticRoutes(next, objects, existing, lining))); setSelectedFixtureId(null); return; }
@@ -777,7 +898,7 @@ export default function Home() {
     };
     window.addEventListener("keydown", handleKeyboard);
     return () => window.removeEventListener("keydown", handleKeyboard);
-  }, [existing, fixtures, lining, objects, routes, selectedFixtureId, selectedObjectId, selectedRouteId, selectedRoutePoint, zoomView]);
+  }, [existing, fixtures, lining, measureMode, measurementDraft, objects, routes, selectedFixtureId, selectedMeasurementId, selectedObjectId, selectedRouteId, selectedRoutePoint, zoomView]);
   useEffect(() => {
     if (!contextMenu) return;
     const closeMenu = (event: globalThis.PointerEvent) => {
@@ -816,11 +937,11 @@ export default function Home() {
   function resetPlan() {
     if (!window.confirm("Créer un nouveau plan ? Le brouillon actuel sera remplacé, mais tes configurations sauvegardées et ta bibliothèque de produits resteront disponibles.")) return;
     const nextExisting = copyPoints(defaultExisting); const nextBuild = { ...defaultBuild }; const nextLining = createLining(nextExisting, nextBuild); const nextFixtures = copyFixtures(defaultFixtures);
-    const nextObjects = copyObjects(defaultObjects); setProjectName("Nouveau projet"); setExisting(nextExisting); setBuild(nextBuild); setLining(nextLining); setFixtures(nextFixtures); setObjects(nextObjects); setRoutes(automaticRoutes(nextFixtures, nextObjects, nextExisting, nextLining)); setBudgetChoices({});
-    setElementSnap(true); setShowPrices(false); setShowAllNetworks(false); setViewport(null); setMode("plan"); setSelectedWall({ layer: "existing", index: 0 }); setSelectedFixtureId(null); setSelectedObjectId(null); setSelectedRouteId(null); setRouteWallWaypointMode(false); setNotice("Nouveau plan créé — les sauvegardes et produits sont conservés");
+    const nextObjects = copyObjects(defaultObjects); setProjectName("Nouveau projet"); setExisting(nextExisting); setBuild(nextBuild); setLining(nextLining); setFixtures(nextFixtures); setObjects(nextObjects); setRoutes(automaticRoutes(nextFixtures, nextObjects, nextExisting, nextLining)); setMeasurements([]); setBudgetChoices({});
+    setElementSnap(true); setShowPrices(false); setShowAllNetworks(false); setMeasurementSnap(true); setDimensionVisibility(defaultDimensionVisibility); setViewport(null); setMode("plan"); setSelectedWall({ layer: "existing", index: 0 }); setSelectedFixtureId(null); setSelectedObjectId(null); setSelectedRouteId(null); setSelectedMeasurementId(null); setMeasurementDraft([]); setMeasurementPreview(null); setMeasureMode(false); setRouteWallWaypointMode(false); setNotice("Nouveau plan créé — les sauvegardes et produits sont conservés");
   }
-  function saveProject() { const name = projectName.trim() || "Projet sans nom"; const saved: SavedProject = { id: uid(), name, updatedAt: new Date().toISOString(), existing: copyPoints(existing), lining: copyPoints(lining), fixtures: copyFixtures(fixtures), objects: copyObjects(objects), routes: copyRoutes(routes), build: { ...build }, budgetChoices: { ...budgetChoices }, elementSnap, showPrices, showAllNetworks }; setSavedProjects((current) => [saved, ...current]); setNotice(`« ${name} » sauvegardé`); }
-  function loadProject(project: SavedProject) { const nextExisting = copyPoints(project.existing); const nextLining = copyPoints(project.lining); const nextFixtures = releaseLightFixtures(copyFixtures(project.fixtures), nextExisting, nextLining); const nextObjects = copyObjects(project.objects); setProjectName(project.name); setExisting(nextExisting); setLining(nextLining); setFixtures(nextFixtures); setObjects(nextObjects); setRoutes(mergeAutomaticRoutes(copyRoutes(project.routes), automaticRoutes(nextFixtures, nextObjects, nextExisting, nextLining))); setBuild({ ...defaultBuild, ...project.build }); setBudgetChoices({ ...project.budgetChoices }); setElementSnap(project.elementSnap ?? true); setShowPrices(project.showPrices ?? false); setShowAllNetworks(project.showAllNetworks ?? false); setViewport(null); setRouteWallWaypointMode(false); setNotice(`« ${project.name} » chargé`); }
+  function saveProject() { const name = projectName.trim() || "Projet sans nom"; const saved: SavedProject = { id: uid(), name, updatedAt: new Date().toISOString(), existing: copyPoints(existing), lining: copyPoints(lining), fixtures: copyFixtures(fixtures), objects: copyObjects(objects), routes: copyRoutes(routes), measurements: copyMeasurements(measurements), build: { ...build }, budgetChoices: { ...budgetChoices }, dimensionVisibility: { ...dimensionVisibility }, measurementSnap, elementSnap, showPrices, showAllNetworks }; setSavedProjects((current) => [saved, ...current]); setNotice(`« ${name} » sauvegardé`); }
+  function loadProject(project: SavedProject) { const nextExisting = copyPoints(project.existing); const nextLining = copyPoints(project.lining); const nextFixtures = releaseLightFixtures(copyFixtures(project.fixtures), nextExisting, nextLining); const nextObjects = copyObjects(project.objects); setProjectName(project.name); setExisting(nextExisting); setLining(nextLining); setFixtures(nextFixtures); setObjects(nextObjects); setRoutes(mergeAutomaticRoutes(copyRoutes(project.routes), automaticRoutes(nextFixtures, nextObjects, nextExisting, nextLining))); setMeasurements(copyMeasurements(project.measurements ?? [])); setBuild({ ...defaultBuild, ...project.build }); setBudgetChoices({ ...project.budgetChoices }); setDimensionVisibility({ ...defaultDimensionVisibility, ...(project.dimensionVisibility ?? {}) }); setMeasurementSnap(project.measurementSnap ?? true); setElementSnap(project.elementSnap ?? true); setShowPrices(project.showPrices ?? false); setShowAllNetworks(project.showAllNetworks ?? false); setViewport(null); setSelectedMeasurementId(null); setMeasurementDraft([]); setMeasurementPreview(null); setMeasureMode(false); setRouteWallWaypointMode(false); setNotice(`« ${project.name} » chargé`); }
 
   function addProduct() { if (!newProduct.name.trim()) return; setProducts((current) => [{ ...newProduct, id: uid() }, ...current]); setNewProduct((current) => ({ ...current, name: "", reference: "", price: 0 })); setNotice("Produit ajouté à la bibliothèque"); }
   function updateProduct(id: string, changes: Partial<Product>) { setProducts((current) => current.map((product) => product.id === id ? { ...product, ...changes } : product)); }
@@ -829,6 +950,7 @@ export default function Home() {
   const wallPath = (points: Point[]) => points.map((point, index) => `${index ? "L" : "M"}${point.x},${point.y}`).join(" ") + " Z";
   const routePath = (route: NetworkRoute) => effectiveRoutePoints(route, fixtures, objects, existing, lining).map((point, index) => `${index ? "L" : "M"}${point.x},${point.y}`).join(" ");
   const euros = (value: number) => new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(value);
+  const contextMeasurePoint = contextMenu ? contextTargetPoint(contextMenu.target) : null;
 
   return (
     <main className="app-shell">
@@ -844,7 +966,20 @@ export default function Home() {
         <div ref={canvasPanelRef} className="canvas-panel">
           <div className="canvas-toolbar">
             <div className="layer-legend"><span><i className="legend-existing" />Mur existant</span><span><i className="legend-lining" />Doublage BA13</span>{mode === "networks" && (showAllNetworks ? (["electric", "cold", "hot"] as NetworkKind[]).map((kind) => <span key={kind}><i className={`legend-${kind}`} />{networkName(kind)}</span>) : <span><i className={`legend-${networkFilter}`} />{networkName(networkFilter)}</span>)}</div>
-            <div><label><input type="checkbox" checked={showDimensions} onChange={(event) => setShowDimensions(event.target.checked)} /> Cotes</label><label><input type="checkbox" checked={showPrices} onChange={(event) => setShowPrices(event.target.checked)} /> Prix</label>{mode === "plan" ? <label><input type="checkbox" checked={orthogonalSnap} onChange={(event) => setOrthogonalSnap(event.target.checked)} /> Aimant murs 90°</label> : <label><input type="checkbox" checked={elementSnap} onChange={(event) => setElementSnap(event.target.checked)} /> Aimant éléments 5 cm</label>}<button type="button" onClick={() => window.print()}>Imprimer</button><span className="editor-shortcuts">Clic droit · Suppr</span></div>
+            <div className="canvas-tools">
+              <details className="dimension-menu">
+                <summary>⌖ Cotes <b>{activeDimensionCount}</b></summary>
+                <div>
+                  {([['existing', 'Murs existants'], ['lining', 'Doublage BA13'], ['layout', 'Aménagement'], ['networks', 'Réseaux'], ['measurements', 'Mesures libres']] as [keyof DimensionVisibility, string][]).map(([key, label]) => <label key={key}><input type="checkbox" checked={dimensionVisibility[key]} onChange={(event) => { const checked = event.currentTarget.checked; setDimensionVisibility((current) => ({ ...current, [key]: checked })); }} /><span>{label}</span></label>)}
+                  <button type="button" onClick={() => setDimensionVisibility({ existing: false, lining: false, layout: false, networks: false, measurements: false })}>Tout masquer</button>
+                </div>
+              </details>
+              <button type="button" className={`measure-tool-button ${measureMode ? "active" : ""}`} onClick={() => measureMode ? cancelMeasurement() : startMeasurement()}>{measureMode ? "× Quitter mesure" : "⌁ Mesurer"}<kbd>M</kbd></button>
+              {measureMode && <><label className="measurement-snap-toggle"><input type="checkbox" checked={measurementSnap} onChange={(event) => setMeasurementSnap(event.currentTarget.checked)} /> Aimant mesure</label><button type="button" className="finish-measure-button" disabled={measurementDraft.length < 2} onClick={finishMeasurement}>Terminer <kbd>Entrée</kbd></button></>}
+              <label><input type="checkbox" checked={showPrices} onChange={(event) => setShowPrices(event.target.checked)} /> Prix</label>
+              {mode === "plan" ? <label><input type="checkbox" checked={orthogonalSnap} onChange={(event) => setOrthogonalSnap(event.target.checked)} /> Aimant murs 90°</label> : <label><input type="checkbox" checked={elementSnap} onChange={(event) => setElementSnap(event.target.checked)} /> Aimant éléments 5 cm</label>}
+              <button type="button" onClick={() => window.print()}>Imprimer</button><span className="editor-shortcuts">M · Entrée · Échap · Clic droit · Suppr</span>
+            </div>
             <div className="canvas-navigation" aria-label="Navigation du plan">
               <button type="button" className="zoom-button" aria-label="Dézoomer" title="Dézoomer" onClick={() => zoomView(1.2)}>−</button>
               <output aria-label="Niveau de zoom">{zoomPercent}%</output>
@@ -855,7 +990,7 @@ export default function Home() {
           </div>
 
           <div className="drawing-stage">
-            <svg ref={svgRef} className={`${routeWallWaypointMode ? "waypoint-mode" : ""} ${isPanning ? "is-panning" : ""}`} viewBox={`${activeView.x} ${activeView.y} ${activeView.width} ${activeView.height}`} role="img" aria-label="Plan interactif de rénovation. Utilisez la molette pour zoomer et faites glisser le fond pour vous déplacer." onContextMenu={openPlanContextMenu} onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
+            <svg ref={svgRef} className={`${routeWallWaypointMode ? "waypoint-mode" : ""} ${isPanning ? "is-panning" : ""} ${measureMode ? "measure-mode" : ""}`} viewBox={`${activeView.x} ${activeView.y} ${activeView.width} ${activeView.height}`} role="img" aria-label="Plan interactif de rénovation. Utilisez la molette pour zoomer et faites glisser le fond pour vous déplacer." onContextMenu={openPlanContextMenu} onPointerDownCapture={handleMeasurementPointerDown} onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
               <defs>
                 <pattern id="cad-grid-minor" width="10" height="10" patternUnits="userSpaceOnUse"><path className="cad-grid-minor" d="M10 0H0V10" fill="none" /></pattern>
                 <pattern id="cad-grid" width="50" height="50" patternUnits="userSpaceOnUse"><rect width="50" height="50" fill="url(#cad-grid-minor)" /><path className="cad-grid-major" d="M50 0H0V50" fill="none" /></pattern>
@@ -865,31 +1000,40 @@ export default function Home() {
               <rect x={activeView.x} y={activeView.y} width={activeView.width} height={activeView.height} fill="url(#cad-grid)" pointerEvents="none" />
               <path d={wallPath(existing)} className="room-fill" pointerEvents="none" />
 
-              {existing.map((_, index) => { const wall = segment(existing, index); const selected = selectedWall?.layer === "existing" && selectedWall.index === index; return <g key={`existing-${index}`}><line className="wall-hit" x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onContextMenu={(event) => { const point = pointFromEvent(event); if (point) openContextMenu(event, { type: "wall", layer: "existing", index, point: projectOnSegment(point, existing, index).point }); }} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedWall({ layer: "existing", index }); clearSelection("wall"); }} /><line className={`wall-line existing-wall ${selected ? "selected" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" />{showDimensions && <g className="wall-dimension" transform={`translate(${(wall.a.x + wall.b.x) / 2},${(wall.a.y + wall.b.y) / 2})`}><rect x="-23" y="-9" width="46" height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{Math.round(segmentLength(existing, index))} cm</text></g>}</g>; })}
-              {lining.map((_, index) => { const wall = segment(lining, index); const selected = selectedWall?.layer === "lining" && selectedWall.index === index; return <g key={`lining-${index}`}><line className={`wall-hit ${routeWallWaypointMode ? "waypoint-target" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onContextMenu={(event) => { const point = pointFromEvent(event); if (point) openContextMenu(event, { type: "wall", layer: "lining", index, point: projectOnSegment(point, lining, index).point }); }} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); if (mode === "networks" && addWallWaypoint(event, index)) return; setSelectedWall({ layer: "lining", index }); clearSelection("wall"); }} /><line className={`wall-line lining-wall ${selected ? "selected" : ""} ${routeWallWaypointMode ? "waypoint-ready" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" /></g>; })}
+              {existing.map((_, index) => { const wall = segment(existing, index); const selected = selectedWall?.layer === "existing" && selectedWall.index === index; const label = wallDimensionLayout.existing[index]; return <g key={`existing-${index}`}><line className="wall-hit" x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onContextMenu={(event) => { const point = pointFromEvent(event); if (point) openContextMenu(event, { type: "wall", layer: "existing", index, point: projectOnSegment(point, existing, index).point }); }} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedWall({ layer: "existing", index }); clearSelection("wall"); }} /><line className={`wall-line existing-wall ${selected ? "selected" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" />{dimensionVisibility.existing && <g className="wall-dimension dimension-existing" transform={`translate(${label.x},${label.y})`}><rect x={-label.width / 2} y="-9" width={label.width} height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{Math.round(segmentLength(existing, index))} cm</text></g>}</g>; })}
+              {lining.map((_, index) => { const wall = segment(lining, index); const selected = selectedWall?.layer === "lining" && selectedWall.index === index; const label = wallDimensionLayout.lining[index]; return <g key={`lining-${index}`}><line className={`wall-hit ${routeWallWaypointMode ? "waypoint-target" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onContextMenu={(event) => { const point = pointFromEvent(event); if (point) openContextMenu(event, { type: "wall", layer: "lining", index, point: projectOnSegment(point, lining, index).point }); }} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); if (mode === "networks" && addWallWaypoint(event, index)) return; setSelectedWall({ layer: "lining", index }); clearSelection("wall"); }} /><line className={`wall-line lining-wall ${selected ? "selected" : ""} ${routeWallWaypointMode ? "waypoint-ready" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" />{dimensionVisibility.lining && <g className="wall-dimension dimension-lining" transform={`translate(${label.x},${label.y})`}><rect x={-label.width / 2} y="-9" width={label.width} height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{Math.round(segmentLength(lining, index))} cm</text></g>}</g>; })}
 
               {mode === "plan" && (selectedWall?.layer === "existing" ? existing : lining).map((point, index) => <circle key={`vertex-${index}`} className={`wall-vertex ${selectedWall?.layer === "lining" ? "lining-vertex" : ""}`} cx={point.x} cy={point.y} r="6" onPointerDown={(event) => beginPointDrag(event, selectedWall?.layer ?? "existing", index)} />)}
 
               {fixtures.filter((fixture) => mode === "plan" ? fixtureMeta[fixture.kind].opening : mode === "networks" ? showAllNetworks ? Boolean(fixtureNetwork(fixture.kind) || fixtureSource(fixture.kind)) : fixtureNetwork(fixture.kind) === networkFilter || fixtureSource(fixture.kind) === networkFilter : mode === "layout" ? fixtureMeta[fixture.kind].opening : true).map((fixture) => {
-                const points = fixture.layer === "existing" ? existing : lining; const wall = segment(points, Math.min(fixture.wallIndex, points.length - 1)); const position = fixturePosition(fixture, existing, lining); const length = Math.hypot(wall.b.x - wall.a.x, wall.b.y - wall.a.y) || 1; const tx = (wall.b.x - wall.a.x) / length; const ty = (wall.b.y - wall.a.y) / length; const half = fixture.width / 2; const opening = fixtureMeta[fixture.kind].opening; const selected = selectedFixtureId === fixture.id;
-                return <g key={fixture.id} className={`wall-fixture ${opening ? "opening-fixture" : "technical-fixture"} ${fixture.freePosition ? "free-fixture" : ""} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={fixture.name} onContextMenu={(event) => openContextMenu(event, { type: "fixture", id: fixture.id })} onPointerDown={(event) => beginFixtureDrag(event, fixture)}>{opening ? <><line x1={position.x - tx * half} y1={position.y - ty * half} x2={position.x + tx * half} y2={position.y + ty * half} stroke={fixtureMeta[fixture.kind].color} /><text x={position.x} y={position.y - 11} textAnchor="middle">{fixture.name}</text></> : <><circle cx={position.x} cy={position.y} r="9" fill={fixtureMeta[fixture.kind].color} /><text x={position.x} y={position.y} textAnchor="middle" dominantBaseline="middle">{fixtureMeta[fixture.kind].short}</text>{fixture.quantity > 1 && <text className="fixture-quantity" x={position.x + 9} y={position.y - 9}>{fixture.quantity}</text>}</>}{showPrices && fixture.showPrice !== false && (fixture.unitPrice ?? 0) > 0 && <g className="price-tag" transform={`translate(${position.x},${position.y + 20})`}><rect x="-27" y="-8" width="54" height="16" rx="7" /><text textAnchor="middle" dominantBaseline="middle">{euros((fixture.unitPrice ?? 0) * fixture.quantity)}</text></g>}</g>;
+                const points = fixture.layer === "existing" ? existing : lining; const wall = segment(points, Math.min(fixture.wallIndex, points.length - 1)); const position = fixturePosition(fixture, existing, lining); const length = Math.hypot(wall.b.x - wall.a.x, wall.b.y - wall.a.y) || 1; const tx = (wall.b.x - wall.a.x) / length; const ty = (wall.b.y - wall.a.y) / length; const orientation = signedArea(points) >= 0 ? 1 : -1; const labelNormal = { x: -ty * orientation, y: tx * orientation }; const half = fixture.width / 2; const opening = fixtureMeta[fixture.kind].opening; const selected = selectedFixtureId === fixture.id;
+                return <g key={fixture.id} className={`wall-fixture ${opening ? "opening-fixture" : "technical-fixture"} ${fixture.freePosition ? "free-fixture" : ""} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={fixture.name} onContextMenu={(event) => openContextMenu(event, { type: "fixture", id: fixture.id })} onPointerDown={(event) => beginFixtureDrag(event, fixture)}>{opening ? <><line x1={position.x - tx * half} y1={position.y - ty * half} x2={position.x + tx * half} y2={position.y + ty * half} stroke={fixtureMeta[fixture.kind].color} /><text x={position.x + labelNormal.x * 17} y={position.y + labelNormal.y * 17} textAnchor="middle" dominantBaseline="middle">{fixture.name}</text></> : <><circle cx={position.x} cy={position.y} r="9" fill={fixtureMeta[fixture.kind].color} /><text x={position.x} y={position.y} textAnchor="middle" dominantBaseline="middle">{fixtureMeta[fixture.kind].short}</text>{fixture.quantity > 1 && <text className="fixture-quantity" x={position.x + 9} y={position.y - 9}>{fixture.quantity}</text>}</>}{showPrices && fixture.showPrice !== false && (fixture.unitPrice ?? 0) > 0 && <g className="price-tag" transform={`translate(${position.x},${position.y + 20})`}><rect x="-27" y="-8" width="54" height="16" rx="7" /><text textAnchor="middle" dominantBaseline="middle">{euros((fixture.unitPrice ?? 0) * fixture.quantity)}</text></g>}</g>;
               })}
 
-              {mode !== "plan" && objects.map((object) => { const selected = selectedObjectId === object.id; const connectedKinds = object.connections ?? []; const visibleConnections = showAllNetworks ? connectedKinds : connectedKinds.includes(networkFilter) ? [networkFilter] : []; const connected = visibleConnections.length > 0; const port = objectConnectionPoint(object, lining); return <g key={object.id} className={`plan-object ${mode === "networks" && !connected ? "ghost" : ""} ${mode === "networks" && connected ? "network-connected" : ""} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={object.name} onContextMenu={(event) => openContextMenu(event, { type: "object", id: object.id })} onPointerDown={(event) => { if (mode !== "networks") { beginObjectDrag(event, object); return; } if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedObjectId(object.id); clearSelection("object"); }}><rect x={object.x} y={object.y} width={object.w} height={object.h} rx="3" fill={objectMeta[object.kind].color} /><text x={object.x + object.w / 2} y={object.y + object.h / 2} textAnchor="middle" dominantBaseline="middle">{object.name}</text>{mode === "layout" && <text className="object-size" x={object.x + object.w / 2} y={object.y + object.h / 2 + 14} textAnchor="middle">{Math.round(object.w)} × {Math.round(object.h)}</text>}{mode === "networks" && visibleConnections.map((kind, index) => { const shift = (index - (visibleConnections.length - 1) / 2) * 14; return <g key={kind} className={`object-network-port port-${kind}`}><circle cx={port.x + shift} cy={port.y} r="8" /><text x={port.x + shift} y={port.y} textAnchor="middle" dominantBaseline="middle">{kind === "electric" ? "E" : kind === "cold" ? "F" : "C"}</text></g>; })}{showPrices && object.showPrice !== false && (object.unitPrice ?? 0) > 0 && <g className="price-tag" transform={`translate(${object.x + object.w / 2},${object.y + object.h + 12})`}><rect x="-27" y="-8" width="54" height="16" rx="7" /><text textAnchor="middle" dominantBaseline="middle">{euros(object.unitPrice ?? 0)}</text></g>}{mode === "layout" && <ObjectResizeZones object={object} onStart={beginObjectResize} />}</g>; })}
+              {mode !== "plan" && objects.map((object) => { const selected = selectedObjectId === object.id; const connectedKinds = object.connections ?? []; const visibleConnections = showAllNetworks ? connectedKinds : connectedKinds.includes(networkFilter) ? [networkFilter] : []; const connected = visibleConnections.length > 0; const port = objectConnectionPoint(object, lining); return <g key={object.id} className={`plan-object ${mode === "networks" && !connected ? "ghost" : ""} ${mode === "networks" && connected ? "network-connected" : ""} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={object.name} onContextMenu={(event) => openContextMenu(event, { type: "object", id: object.id })} onPointerDown={(event) => { if (mode !== "networks") { beginObjectDrag(event, object); return; } if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedObjectId(object.id); clearSelection("object"); }}><rect x={object.x} y={object.y} width={object.w} height={object.h} rx="3" fill={objectMeta[object.kind].color} /><text x={object.x + object.w / 2} y={object.y + object.h / 2} textAnchor="middle" dominantBaseline="middle">{object.name}</text>{dimensionVisibility.layout && <text className="object-size" x={object.x + object.w / 2} y={object.y + object.h / 2 + 14} textAnchor="middle">{Math.round(object.w)} × {Math.round(object.h)} cm</text>}{mode === "networks" && visibleConnections.map((kind, index) => { const shift = (index - (visibleConnections.length - 1) / 2) * 14; return <g key={kind} className={`object-network-port port-${kind}`}><circle cx={port.x + shift} cy={port.y} r="8" /><text x={port.x + shift} y={port.y} textAnchor="middle" dominantBaseline="middle">{kind === "electric" ? "E" : kind === "cold" ? "F" : "C"}</text></g>; })}{showPrices && object.showPrice !== false && (object.unitPrice ?? 0) > 0 && <g className="price-tag" transform={`translate(${object.x + object.w / 2},${object.y + object.h + 12})`}><rect x="-27" y="-8" width="54" height="16" rx="7" /><text textAnchor="middle" dominantBaseline="middle">{euros(object.unitPrice ?? 0)}</text></g>}{mode === "layout" && <ObjectResizeZones object={object} onStart={beginObjectResize} />}</g>; })}
 
-              {mode === "networks" && routes.filter((route) => showAllNetworks || route.kind === networkFilter).map((route) => {
+              {mode === "networks" && visibleRoutes.map((route) => {
                 const freeTerminal = !route.targetFixtureId && !route.targetObjectId
                   ? effectiveRoutePoints(route, fixtures, objects, existing, lining).at(-1)
                   : undefined;
+                const networkLabel = networkDimensionLayout.get(route.id);
                 return <g key={route.id} className={`network-route route-${route.kind} ${selectedRouteId === route.id ? "selected" : ""}`}>
                   <path className="route-hit" d={routePath(route)} onContextMenu={(event) => openContextMenu(event, { type: "route", id: route.id })} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedRouteId(route.id); setRouteWallWaypointMode(false); clearSelection("route"); }} />
                   <path d={routePath(route)} pointerEvents="none" />
+                  {dimensionVisibility.networks && networkLabel && <g className="network-dimension" transform={`translate(${networkLabel.x},${networkLabel.y})`}><rect x={-networkLabel.width / 2} y="-9" width={networkLabel.width} height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{networkLabel.text}</text></g>}
                   {freeTerminal && <g className="route-exit-marker" transform={`translate(${freeTerminal.x},${freeTerminal.y})`} role="button" tabIndex={0} aria-label={`${route.name}, sortie vers une autre pièce`} onContextMenu={(event) => openContextMenu(event, { type: "route", id: route.id })} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedRouteId(route.id); setRouteWallWaypointMode(false); clearSelection("route"); }}>
                     <title>{route.name}</title><circle r="9" /><text className="route-exit-symbol" textAnchor="middle" dominantBaseline="middle">↗</text><text className="route-exit-label" x="13" y="-12">Vers autre pièce</text>
                   </g>}
                 </g>;
               })}
               {mode === "networks" && selectedRoute && (showAllNetworks || selectedRoute.kind === networkFilter) && <g className={`route-handles handles-${selectedRoute.kind}`}>{effectiveRouteHandles(selectedRoute, fixtures, objects, existing, lining).map(({ point, storedIndex, terminal, wallWaypoint }) => <circle key={storedIndex} cx={point.x} cy={point.y} r={terminal ? 4 : wallWaypoint ? 8 : 7} className={`${terminal ? "anchored" : wallWaypoint ? "wall-waypoint" : "movable"} ${selectedRoutePoint?.routeId === selectedRoute.id && selectedRoutePoint.pointIndex === storedIndex ? "selected" : ""}`} onContextMenu={(event) => openContextMenu(event, { type: "route-point", routeId: selectedRoute.id, pointIndex: storedIndex })} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedRoutePoint({ routeId: selectedRoute.id, pointIndex: storedIndex }); if (terminal) return; const start = pointFromEvent(event); if (!start) return; event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "route-point", routeId: selectedRoute.id, pointIndex: storedIndex, start, origin: point }; }} />)}</g>}
+              {dimensionVisibility.measurements && measurements.map((measurement) => { const summary = measurementSummary(measurement.points); const midpoint = polylineMidpoint(measurement.points); const width = Math.max(58, summary.length * 4.35 + 16); const selected = selectedMeasurementId === measurement.id; const polyline = measurement.points.map((point) => `${point.x},${point.y}`).join(" "); return <g key={measurement.id} className={`manual-measurement ${selected ? "selected" : ""}`}>
+                <polyline className="measurement-hit" points={polyline} onContextMenu={(event) => openContextMenu(event, { type: "measurement", id: measurement.id })} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedMeasurementId(measurement.id); clearSelection("measurement"); }} />
+                <polyline className="measurement-line" points={polyline} pointerEvents="none" />
+                <g className="measurement-badge" transform={`translate(${midpoint.x},${midpoint.y - 14})`} pointerEvents="none"><rect x={-width / 2} y="-9" width={width} height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{summary}</text></g>
+                {selected && measurement.points.map((point, index) => <circle key={index} className="measurement-handle" cx={point.x} cy={point.y} r="6" onContextMenu={(event) => openContextMenu(event, { type: "measurement", id: measurement.id })} onPointerDown={(event) => beginMeasurementPointDrag(event, measurement.id, index)} />)}
+              </g>; })}
+              {measureMode && measurementDisplayPoints.length > 0 && (() => { const summary = measurementSummary(measurementDisplayPoints); const midpoint = polylineMidpoint(measurementDisplayPoints); const width = Math.max(58, summary.length * 4.35 + 16); const polyline = measurementDisplayPoints.map((point) => `${point.x},${point.y}`).join(" "); return <g className="manual-measurement measurement-draft" pointerEvents="none"><polyline className="measurement-line" points={polyline} />{measurementDisplayPoints.map((point, index) => <circle key={index} className="measurement-draft-point" cx={point.x} cy={point.y} r={index === measurementDisplayPoints.length - 1 ? 5 : 3.5} />)}<g className="measurement-badge" transform={`translate(${midpoint.x},${midpoint.y - 14})`}><rect x={-width / 2} y="-9" width={width} height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{summary}</text></g></g>; })()}
             </svg>
           </div>
           <div className="canvas-footer"><span><b>{existing.length}</b> angles du bâti</span><span><b>{metrics.existingPerimeter.toFixed(1)} m</b> de murs existants</span><span><b>{metrics.liningPerimeter.toFixed(1)} m</b> de doublage</span><span><b>{metrics.openingArea.toFixed(1)} m²</b> d’ouvertures déduites</span></div>
@@ -987,7 +1131,9 @@ export default function Home() {
         {contextMenu.target.type === "fixture" && (() => { const fixture = fixtures.find((entry) => entry.id === contextMenu.target.id); if (!fixture) return null; return <><div className="context-menu-title"><span>{fixture.name}</span><small>{fixture.freePosition ? "Position libre" : `Mur ${fixture.wallIndex + 1}`}</small></div><button type="button" role="menuitem" onClick={() => runContextAction(() => duplicateFixture(fixture.id))}><i>⧉</i>Dupliquer <kbd>Ctrl D</kbd></button><div className="context-menu-separator" /><button type="button" role="menuitem" className="danger" onClick={() => runContextAction(() => deleteFixtureById(fixture.id))}><i>×</i>Supprimer <kbd>Suppr</kbd></button></>; })()}
         {contextMenu.target.type === "route" && (() => { const route = routes.find((entry) => entry.id === contextMenu.target.id); if (!route) return null; return <><div className="context-menu-title"><span>{route.name}</span><small>{routeLength(route, fixtures, objects, existing, lining).toFixed(1)} m</small></div><button type="button" role="menuitem" onClick={() => runContextAction(() => { setSelectedRouteId(route.id); setRouteWallWaypointMode(true); setNotice("Clique sur le mur BA13 à emprunter"); })}><i>＋</i>Imposer un mur</button><div className="context-menu-separator" /><button type="button" role="menuitem" className="danger" onClick={() => runContextAction(() => deleteRoute(route.id))}><i>×</i>Supprimer le tracé <kbd>Suppr</kbd></button></>; })()}
         {contextMenu.target.type === "route-point" && (() => { const route = routes.find((entry) => entry.id === contextMenu.target.routeId); const removable = !!route && contextMenu.target.pointIndex > 0 && contextMenu.target.pointIndex < route.points.length - 1; return <><div className="context-menu-title"><span>{removable ? "Nœud de passage" : "Extrémité raccordée"}</span><small>{removable ? "Aimanté au BA13" : "Liée à son élément"}</small></div><button type="button" role="menuitem" className="danger" disabled={!removable} onClick={() => runContextAction(() => deleteRoutePoint(contextMenu.target.type === "route-point" ? contextMenu.target.routeId : "", contextMenu.target.type === "route-point" ? contextMenu.target.pointIndex : -1))}><i>×</i>{removable ? "Supprimer le nœud" : "Extrémité non supprimable"}<kbd>Suppr</kbd></button></>; })()}
+        {contextMenu.target.type === "measurement" && (() => { const measurement = measurements.find((entry) => entry.id === contextMenu.target.id); if (!measurement) return null; return <><div className="context-menu-title"><span>Mesure libre</span><small>{measurementSummary(measurement.points)}</small></div><button type="button" role="menuitem" className="danger" onClick={() => runContextAction(() => deleteMeasurement(measurement.id))}><i>×</i>Supprimer la mesure <kbd>Suppr</kbd></button></>; })()}
         {contextMenu.target.type === "wall" && <><div className="context-menu-title"><span>{contextMenu.target.layer === "lining" ? "Doublage BA13" : "Mur existant"}</span><small>Segment {contextMenu.target.index + 1}</small></div>{mode === "plan" && <button type="button" role="menuitem" onClick={() => runContextAction(() => addWallPointAt(contextMenu.target.type === "wall" ? contextMenu.target : { type: "wall", layer: "existing", index: 0, point: { x: 0, y: 0 } }))}><i>＋</i>Ajouter un point ici</button>}{mode === "plan" && contextMenu.target.layer === "existing" && <><button type="button" role="menuitem" onClick={() => runContextAction(() => addFixture("door", contextMenu.target.type === "wall" ? contextMenu.target.point : undefined))}><i>▯</i>Placer une porte ici</button><button type="button" role="menuitem" onClick={() => runContextAction(() => addFixture("window", contextMenu.target.type === "wall" ? contextMenu.target.point : undefined))}><i>═</i>Placer une fenêtre ici</button></>}{mode === "networks" && contextMenu.target.layer === "lining" && selectedRoute && <button type="button" role="menuitem" onClick={() => runContextAction(() => addRouteWaypointAt(contextMenu.target.type === "wall" ? contextMenu.target : { type: "wall", layer: "lining", index: 0, point: { x: 0, y: 0 } }))}><i>◎</i>Faire passer le tracé ici</button>}{mode === "networks" && !showAllNetworks && contextMenu.target.layer === "lining" && networkFilter === "electric" && <button type="button" role="menuitem" onClick={() => runContextAction(() => addFixture("outlet", contextMenu.target.type === "wall" ? contextMenu.target.point : undefined))}><i>⊡</i>Placer une prise ici</button>}{mode === "networks" && !showAllNetworks && contextMenu.target.layer === "lining" && networkFilter !== "electric" && <button type="button" role="menuitem" onClick={() => runContextAction(() => addFixture(networkFilter === "cold" ? "water-cold" : "water-hot", contextMenu.target.type === "wall" ? contextMenu.target.point : undefined))}><i>◉</i>Placer une sortie ici</button>}</>}
+        {contextMenu.target.type !== "measurement" && contextMeasurePoint && <><div className="context-menu-separator" /><button type="button" role="menuitem" className="context-measure-action" onClick={() => runContextAction(() => startMeasurement(contextMeasurePoint))}><i>⌁</i>Mesurer depuis ici <kbd>M</kbd></button></>}
         <div className="context-menu-help">Clic droit : changer de cible · Clic gauche hors menu ou Échap : fermer</div>
       </div>}
     </main>
