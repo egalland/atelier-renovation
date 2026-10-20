@@ -35,7 +35,7 @@ button { color: inherit; }
   min-height: 76px;
   padding: 12px clamp(16px, 2.5vw, 36px);
   display: grid;
-  grid-template-columns: minmax(230px, .8fr) auto minmax(290px, .8fr);
+  grid-template-columns: minmax(230px, .8fr) auto minmax(390px, .9fr);
   gap: 20px;
   align-items: center;
   border-bottom: 1px solid rgba(255,255,255,.08);
@@ -58,6 +58,8 @@ button { color: inherit; }
 .project-actions > input:focus { border-color: var(--blue); }
 .save-button { padding: 9px 12px; border: 1px solid #3b82f6; border-radius: 9px; background: rgba(37,99,235,.15); color: #bfdbfe; cursor: pointer; font-size: .66rem; }
 .save-button:hover { background: #2563eb; color: white; }
+.new-plan-button { padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: transparent; color: var(--muted); cursor: pointer; font-size: .63rem; }
+.new-plan-button:hover { border-color: #64748b; color: white; background: rgba(255,255,255,.04); }
 .project-menu { position: relative; }
 .project-menu summary { display: grid; place-items: center; width: 35px; height: 35px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); color: #93c5fd; cursor: pointer; list-style: none; font-size: .65rem; font-weight: 800; }
 .project-menu summary::-webkit-details-marker { display: none; }
@@ -121,6 +123,9 @@ button { color: inherit; }
 .technical-fixture text { fill: white; font-size: 7px; font-weight: 850; pointer-events: none; }
 .technical-fixture.selected circle { stroke: #111827; stroke-width: 4; }
 .fixture-quantity { fill: #111827 !important; font-size: 7px !important; paint-order: stroke; stroke: white; stroke-width: 3px; }
+.price-tag { pointer-events: none; }
+.price-tag rect { fill: #0f172a !important; stroke: #22c55e !important; stroke-width: 1 !important; filter: url(#soft-shadow); }
+.price-tag text { fill: #dcfce7 !important; stroke: none !important; font-size: 6.5px !important; font-weight: 800 !important; }
 
 .plan-object { cursor: grab; outline: none; }
 .plan-object > rect:first-child { fill-opacity: .85; stroke: rgba(15,23,42,.72); stroke-width: 1.3; }
@@ -175,6 +180,14 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .lining-card > div { display: flex; justify-content: space-between; font-size: .66rem; }
 .lining-card > div span { color: var(--muted); }
 .lining-card input[type="range"] { width: 100%; margin: 12px 0; accent-color: var(--cyan); }
+.lining-toggle { margin: 0 0 9px; padding: 9px; display: flex; gap: 8px; align-items: center; border: 1px solid var(--line); border-radius: 8px; background: #0d1422; color: #dbeafe; font-size: .58rem; }
+.lining-toggle input { accent-color: var(--cyan); }
+.lining-tolerance { margin-bottom: 8px; padding: 8px 9px; display: flex; justify-content: space-between; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 8px; background: #0d1422; color: var(--muted); font-size: .55rem; }
+.lining-tolerance > div { display: flex; align-items: baseline; gap: 4px; }
+.lining-tolerance input { width: 46px; border: 0; outline: none; background: transparent; color: white; text-align: right; font-size: .7rem; font-weight: 800; }
+.lining-tolerance small { color: var(--muted); font-size: .52rem; }
+.lining-result { margin-bottom: 10px; padding: 0 2px; color: var(--muted); }
+.lining-result strong { color: #67e8f9; }
 .lining-card button { width: 100%; min-height: 38px; border: 1px solid #0891b2; border-radius: 8px; background: rgba(6,182,212,.1); color: #a5f3fc; cursor: pointer; font-size: .62rem; }
 .lining-card p { margin: 9px 0 0; color: var(--muted); font-size: .57rem; line-height: 1.5; }
 .empty-selection { min-height: 180px; display: grid; place-content: center; justify-items: center; text-align: center; }
@@ -187,6 +200,8 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .fixture-tools span { font-size: .65rem; }
 .fixture-tools small { margin-top: 3px; color: var(--muted); font-size: .53rem; }
 .fixture-card .wide-danger { width: 100%; min-height: 36px; margin-top: 10px; border: 1px solid rgba(251,113,133,.25); border-radius: 8px; background: transparent; cursor: pointer; font-size: .59rem; }
+.display-price-toggle { margin-top: 10px; display: flex; gap: 7px; align-items: center; color: var(--muted); font-size: .57rem; }
+.display-price-toggle input { accent-color: var(--green); }
 
 .object-catalog { margin: 15px 0; display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .object-catalog button { min-height: 44px; padding: 7px 8px; display: grid; grid-template-columns: 7px 1fr auto; gap: 7px; align-items: center; text-align: left; border: 1px solid var(--line); border-radius: 8px; background: #0d1422; cursor: pointer; }
@@ -211,9 +226,17 @@ button:disabled { opacity: .35; cursor: not-allowed; }
 .budget-total span { color: #a7f3d0; font-size: .58rem; }
 .budget-total strong { margin: 3px 0; font-size: 1.35rem; }
 .budget-total small { color: rgba(255,255,255,.65); font-size: .53rem; }
+.budget-breakdown { margin-top: 10px; padding-top: 9px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; border-top: 1px solid rgba(255,255,255,.18); }
+.budget-breakdown small { display: flex; justify-content: space-between; gap: 7px; }
+.budget-breakdown b { color: white; }
 .settings-card summary, .add-product summary { cursor: pointer; font-size: .65rem; font-weight: 750; }
 .settings-card > label { margin-top: 11px; display: flex; gap: 7px; align-items: flex-start; color: var(--muted); font-size: .57rem; }
 .settings-card input[type="checkbox"] { accent-color: var(--blue); }
+.element-price-list { margin-top: 10px; display: grid; gap: 5px; }
+.element-price-list > label { min-width: 0; padding: 7px 8px; display: grid; grid-template-columns: minmax(0, 1fr) 66px auto; gap: 5px; align-items: center; border-radius: 7px; background: #0d1422; }
+.element-price-list span { overflow: hidden; color: #dbeafe; font-size: .55rem; text-overflow: ellipsis; white-space: nowrap; }
+.element-price-list input { width: 100%; border: 0; outline: none; background: transparent; color: white; text-align: right; font-size: .62rem; font-weight: 750; }
+.element-price-list small { color: var(--muted); font-size: .48rem; }
 .purchase-list { margin-top: 15px; display: grid; gap: 9px; }
 .purchase-list article { padding: 13px; border: 1px solid var(--line); border-radius: 11px; background: rgba(23,32,51,.58); }
 .purchase-list article.insufficient { border-color: rgba(251,113,133,.45); }
