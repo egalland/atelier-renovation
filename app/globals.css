@@ -228,11 +228,20 @@ button { color: inherit; }
 .network-route.selected path:not(.route-hit) { stroke-width: 5; filter: drop-shadow(0 2px 2px rgba(15,23,42,.28)); }
 .route-hit { fill: none; stroke: transparent; stroke-width: 17; pointer-events: stroke; cursor: pointer; }
 .network-dimension { pointer-events: none; filter: drop-shadow(0 2px 2px rgba(15,23,42,.18)); }
-.network-dimension rect { fill: #0f172a; stroke-width: 1.5; }
-.network-dimension text { fill: white; font-size: 7px; font-weight: 800; }
+.network-dimension rect { fill: rgba(15,23,42,.96); stroke-width: 2; }
+.network-dimension text { fill: white; font-size: 8px; font-weight: 850; letter-spacing: .01em; }
+.network-dimension-leader { stroke: #64748b; stroke-width: 1.2; stroke-dasharray: 3 2; }
+.network-dimension-anchor { fill: #64748b; stroke: white; stroke-width: 1; }
 .route-electric .network-dimension rect { stroke: var(--amber); }
 .route-cold .network-dimension rect { stroke: var(--cold); }
 .route-hot .network-dimension rect { stroke: var(--hot); }
+.route-electric .network-dimension-leader { stroke: var(--amber); }
+.route-cold .network-dimension-leader { stroke: var(--cold); }
+.route-hot .network-dimension-leader { stroke: var(--hot); }
+.route-electric .network-dimension-anchor { fill: var(--amber); }
+.route-cold .network-dimension-anchor { fill: var(--cold); }
+.route-hot .network-dimension-anchor { fill: var(--hot); }
+.network-route.selected .network-dimension rect { fill: #020617; stroke-width: 3; }
 .route-exit-marker { cursor: pointer; outline: none; }
 .route-exit-marker circle { fill: #0f172a; stroke: white; stroke-width: 3; filter: url(#soft-shadow); transition: 130ms ease; }
 .route-electric .route-exit-marker circle { stroke: var(--amber); }

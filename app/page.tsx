@@ -263,8 +263,24 @@ function wallDimensionPlacements(points: Point[], side: "inside" | "outside", oc
     return placement;
   });
 }
-function placeFloatingDimension(point: Point, width: number, occupied: { x: number; y: number; width: number; height: number }[]) {
-  const candidates = [0, -22, 22, -44, 44, -66, 66].map((offset) => ({ x: point.x, y: point.y + offset, width, height: 18 }));
+function pointAtPolylineFraction(points: Point[], fraction: number) {
+  if (points.length < 2) return { point: points[0] ?? { x: 0, y: 0 }, tangent: { x: 1, y: 0 } };
+  const total = polylineLength(points); const target = total * clamp(fraction, 0, 1); let travelled = 0;
+  for (let index = 1; index < points.length; index += 1) {
+    const previous = points[index - 1]; const current = points[index]; const dx = current.x - previous.x; const dy = current.y - previous.y; const length = Math.hypot(dx, dy) || 0.001;
+    if (travelled + length >= target) { const ratio = (target - travelled) / length; return { point: { x: previous.x + dx * ratio, y: previous.y + dy * ratio }, tangent: { x: dx / length, y: dy / length } }; }
+    travelled += length;
+  }
+  const last = points.at(-1)!; const previous = points.at(-2)!; const length = Math.hypot(last.x - previous.x, last.y - previous.y) || 1;
+  return { point: { ...last }, tangent: { x: (last.x - previous.x) / length, y: (last.y - previous.y) / length } };
+}
+function placeNetworkDimension(points: Point[], width: number, routeIndex: number, occupied: { x: number; y: number; width: number; height: number }[]) {
+  const distributed = 0.16 + ((routeIndex * 0.38196601125) % 1) * 0.68;
+  const fractions = Array.from(new Set([distributed, 0.22, 0.78, 0.36, 0.64, 0.1, 0.9].map((value) => round(clamp(value, 0.06, 0.94), 3))));
+  const candidates = fractions.flatMap((fraction) => {
+    const { point: anchor, tangent } = pointAtPolylineFraction(points, fraction); const normal = { x: -tangent.y, y: tangent.x };
+    return [26, -26, 44, -44, 64, -64, 84, -84, 0].flatMap((normalOffset) => [0, 22, -22].map((tangentOffset) => ({ x: anchor.x + normal.x * normalOffset + tangent.x * tangentOffset, y: anchor.y + normal.y * normalOffset + tangent.y * tangentOffset, width, height: 20, anchor })));
+  });
   const placement = candidates.find((candidate) => !occupied.some((box) => dimensionBoxesOverlap(candidate, box))) ?? candidates.at(-1)!;
   occupied.push(placement); return placement;
 }
@@ -494,12 +510,15 @@ export default function Home() {
     return { existing: wallDimensionPlacements(existing, "outside", occupied), lining: wallDimensionPlacements(lining, "inside", occupied) };
   }, [existing, lining]);
   const networkDimensionLayout = useMemo(() => {
-    const occupied: { x: number; y: number; width: number; height: number }[] = [];
-    return new Map(visibleRoutes.map((route) => {
-      const points = effectiveRoutePoints(route, fixtures, objects, existing, lining); const text = `${routeLength(route, fixtures, objects, existing, lining).toFixed(1)} m`; const width = Math.max(46, text.length * 4.6 + 14);
-      return [route.id, { ...placeFloatingDimension(polylineMidpoint(points), width, occupied), text }] as const;
+    const occupied: { x: number; y: number; width: number; height: number }[] = objects.map((object) => ({ x: object.x + object.w / 2, y: object.y + object.h / 2, width: object.w + 14, height: object.h + 14 }));
+    fixtures.forEach((fixture) => { const point = fixturePosition(fixture, existing, lining); occupied.push({ x: point.x, y: point.y, width: Math.max(28, fixture.width + 10), height: 26 }); });
+    if (dimensionVisibility.existing) wallDimensionLayout.existing.forEach((label) => occupied.push({ ...label, height: 18 }));
+    if (dimensionVisibility.lining) wallDimensionLayout.lining.forEach((label) => occupied.push({ ...label, height: 18 }));
+    return new Map(visibleRoutes.map((route, routeIndex) => {
+      const points = effectiveRoutePoints(route, fixtures, objects, existing, lining); const text = `${routeLength(route, fixtures, objects, existing, lining).toFixed(1)} m`; const width = Math.max(52, text.length * 5 + 16);
+      return [route.id, { ...placeNetworkDimension(points, width, routeIndex, occupied), text }] as const;
     }));
-  }, [visibleRoutes, fixtures, objects, existing, lining]);
+  }, [visibleRoutes, fixtures, objects, existing, lining, dimensionVisibility.existing, dimensionVisibility.lining, wallDimensionLayout]);
   const measurementDisplayPoints = useMemo(() => {
     if (!measurementDraft.length || !measurementPreview) return measurementDraft;
     const last = measurementDraft.at(-1)!; return Math.hypot(last.x - measurementPreview.x, last.y - measurementPreview.y) < 0.1 ? measurementDraft : [...measurementDraft, measurementPreview];
@@ -1020,7 +1039,7 @@ export default function Home() {
                 return <g key={route.id} className={`network-route route-${route.kind} ${selectedRouteId === route.id ? "selected" : ""}`}>
                   <path className="route-hit" d={routePath(route)} onContextMenu={(event) => openContextMenu(event, { type: "route", id: route.id })} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedRouteId(route.id); setRouteWallWaypointMode(false); clearSelection("route"); }} />
                   <path d={routePath(route)} pointerEvents="none" />
-                  {dimensionVisibility.networks && networkLabel && <g className="network-dimension" transform={`translate(${networkLabel.x},${networkLabel.y})`}><rect x={-networkLabel.width / 2} y="-9" width={networkLabel.width} height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{networkLabel.text}</text></g>}
+                  {dimensionVisibility.networks && networkLabel && <g className="network-dimension" transform={`translate(${networkLabel.x},${networkLabel.y})`}><line className="network-dimension-leader" x1={networkLabel.anchor.x - networkLabel.x} y1={networkLabel.anchor.y - networkLabel.y} x2="0" y2="0" /><circle className="network-dimension-anchor" cx={networkLabel.anchor.x - networkLabel.x} cy={networkLabel.anchor.y - networkLabel.y} r="2.5" /><rect x={-networkLabel.width / 2} y="-10" width={networkLabel.width} height="20" rx="9" /><text textAnchor="middle" dominantBaseline="middle">{networkLabel.text}</text></g>}
                   {freeTerminal && <g className="route-exit-marker" transform={`translate(${freeTerminal.x},${freeTerminal.y})`} role="button" tabIndex={0} aria-label={`${route.name}, sortie vers une autre pièce`} onContextMenu={(event) => openContextMenu(event, { type: "route", id: route.id })} onPointerDown={(event) => { if (event.button !== 0) return; event.preventDefault(); event.stopPropagation(); setSelectedRouteId(route.id); setRouteWallWaypointMode(false); clearSelection("route"); }}>
                     <title>{route.name}</title><circle r="9" /><text className="route-exit-symbol" textAnchor="middle" dominantBaseline="middle">↗</text><text className="route-exit-label" x="13" y="-12">Vers autre pièce</text>
                   </g>}
