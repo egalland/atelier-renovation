@@ -35,7 +35,7 @@ type WallFixture = {
   showPrice?: boolean;
 };
 
-type ObjectKind = "cabinet" | "tall" | "worktop" | "appliance" | "dishwasher" | "sanitary" | "table" | "radiator" | "custom";
+type ObjectKind = "cabinet" | "tall" | "worktop" | "appliance" | "sanitary" | "table" | "radiator" | "custom";
 type PlanObject = { id: string; kind: ObjectKind; name: string; x: number; y: number; w: number; h: number; connections?: NetworkKind[]; unitPrice?: number; showPrice?: boolean };
 type NetworkRoute = { id: string; kind: NetworkKind; name: string; points: RoutePoint[]; sourceFixtureId?: string; targetFixtureId?: string; targetObjectId?: string };
 
@@ -119,7 +119,6 @@ const objectMeta: Record<ObjectKind, { label: string; w: number; h: number; colo
   tall: { label: "Colonne", w: 60, h: 60, color: "#475569" },
   worktop: { label: "Plan de travail", w: 180, h: 65, color: "#0f766e" },
   appliance: { label: "Électroménager", w: 60, h: 60, color: "#334155", connections: ["electric"] },
-  dishwasher: { label: "Lave-vaisselle", w: 60, h: 60, color: "#0369a1", connections: ["electric", "cold"] },
   sanitary: { label: "Équipement sanitaire", w: 90, h: 60, color: "#0891b2", connections: ["cold", "hot"] },
   table: { label: "Table / îlot", w: 160, h: 80, color: "#7c3aed" },
   radiator: { label: "Radiateur", w: 100, h: 18, color: "#ef4444" },
