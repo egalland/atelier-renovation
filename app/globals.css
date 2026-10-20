@@ -192,9 +192,10 @@ button { color: inherit; }
 .opening-fixture line { stroke-width: 10; stroke-linecap: butt; paint-order: stroke; filter: drop-shadow(0 1px 1px rgba(15,23,42,.22)); }
 .opening-fixture text { fill: #334155; font-size: 8px; font-weight: 700; paint-order: stroke; stroke: #f7f9fc; stroke-width: 3px; pointer-events: none; }
 .wall-fixture.selected line { stroke-width: 14; }
-.technical-fixture circle { stroke: white; stroke-width: 2; filter: url(#soft-shadow); }
+.technical-fixture circle { stroke: white; stroke-width: 3; filter: url(#soft-shadow); }
 .technical-fixture text { fill: white; font-size: 7px; font-weight: 850; pointer-events: none; }
 .technical-fixture.selected circle { stroke: #111827; stroke-width: 4; }
+.technical-fixtures-foreground { isolation: isolate; }
 .fixture-quantity { fill: #111827 !important; font-size: 7px !important; paint-order: stroke; stroke: white; stroke-width: 3px; }
 .price-tag { pointer-events: none; }
 .price-tag rect { fill: #0f172a !important; stroke: #22c55e !important; stroke-width: 1 !important; filter: url(#soft-shadow); }
