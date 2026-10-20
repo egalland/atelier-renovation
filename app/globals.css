@@ -208,6 +208,14 @@ button { color: inherit; }
 .route-hot path:not(.route-hit) { stroke: var(--hot); }
 .network-route.selected path:not(.route-hit) { stroke-width: 5; filter: drop-shadow(0 2px 2px rgba(15,23,42,.28)); }
 .route-hit { fill: none; stroke: transparent; stroke-width: 17; pointer-events: stroke; cursor: pointer; }
+.route-exit-marker { cursor: pointer; outline: none; }
+.route-exit-marker circle { fill: #0f172a; stroke: white; stroke-width: 3; filter: url(#soft-shadow); transition: 130ms ease; }
+.route-electric .route-exit-marker circle { stroke: var(--amber); }
+.route-cold .route-exit-marker circle { stroke: var(--cold); }
+.route-hot .route-exit-marker circle { stroke: var(--hot); }
+.network-route.selected .route-exit-marker circle, .route-exit-marker:hover circle { r: 11px; stroke-width: 4; }
+.route-exit-symbol { fill: white; font-size: 8px; font-weight: 900; pointer-events: none; }
+.route-exit-label { fill: #263449; stroke: #f7f9fc; stroke-width: 3px; paint-order: stroke; stroke-linejoin: round; font-size: 7px; font-weight: 850; pointer-events: none; }
 .route-handles circle { fill: white; stroke-width: 3; filter: url(#soft-shadow); }
 .route-handles .movable { cursor: move; }
 .route-handles .anchored { fill: #111827; }
