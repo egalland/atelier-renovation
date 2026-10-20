@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type Location = "wall" | "peninsula";
 
@@ -73,6 +73,9 @@ function PlanRect({
   label,
   fill,
   compact,
+  moduleId,
+  selected,
+  onSelect,
 }: {
   x: number;
   y: number;
@@ -81,12 +84,28 @@ function PlanRect({
   label: string;
   fill: string;
   compact?: string;
+  moduleId?: string;
+  selected?: boolean;
+  onSelect?: (id: string) => void;
 }) {
   const displayLabel = width >= 120 ? label : (compact ?? label);
+  const interactive = Boolean(moduleId && onSelect);
 
   return (
-    <g>
-      <rect x={x} y={y} width={width} height={height} fill={fill} fillOpacity="0.2" stroke={fill} strokeWidth="1.5" />
+    <g
+      className={interactive ? "plan-module-group" : undefined}
+      role={interactive ? "button" : undefined}
+      tabIndex={interactive ? 0 : undefined}
+      aria-label={interactive ? `Afficher la fiche : ${label}` : undefined}
+      onClick={interactive ? () => onSelect?.(moduleId!) : undefined}
+      onKeyDown={interactive ? (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onSelect?.(moduleId!);
+        }
+      } : undefined}
+    >
+      <rect className={selected ? "plan-module selected" : "plan-module"} x={x} y={y} width={width} height={height} fill={fill} fillOpacity="0.2" stroke={fill} strokeWidth="1.5" />
       <text x={x + width / 2} y={y + height / 2} textAnchor="middle" dominantBaseline="middle">
         {displayLabel}
       </text>
@@ -103,13 +122,16 @@ export default function Home() {
   const [hobLocation, setHobLocation] = useState<Location>("wall");
   const [showFlow, setShowFlow] = useState(true);
   const [showDimensions, setShowDimensions] = useState(true);
+  const [selectedModule, setSelectedModule] = useState("prep");
+  const [hydrated, setHydrated] = useState(false);
 
   const peninsulaX = 470 - length;
   const peninsulaY = 60 + aisle;
   const rearClearance = Math.max(0, 440 - (peninsulaY + depth) - (stools ? 45 : 0));
-  const prepWidth = Math.max(60, length - 120);
+  const prepWidth = Math.max(60, length - (sinkLocation === "wall" ? 120 : 150));
   const workComfort = aisle >= 100 && aisle <= 130;
   const rearComfort = rearClearance >= 100;
+  const equipmentComfort = !(sinkLocation === "peninsula" && hobLocation === "peninsula");
 
   const flowPoints = useMemo(() => {
     const sink = sinkLocation === "wall" ? [500, 105] : [440, peninsulaY + depth / 2];
@@ -118,12 +140,65 @@ export default function Home() {
     return [[150, 72], sink, prep, hob];
   }, [sinkLocation, hobLocation, peninsulaX, peninsulaY, depth, prepWidth]);
 
+  const moduleInfo = useMemo(() => ({
+    pantry: { title: "Garde-manger", size: "60 × 60 cm", text: "Colonne de réserve pour l’épicerie et les petits appareils rarement utilisés." },
+    oven: { title: "Colonne four", size: "60 × 60 cm", text: "Four à hauteur confortable, avec micro-ondes ou niche au-dessus." },
+    fridge: { title: "Réfrigérateur", size: "60 × 60 cm", text: "Placée au bord de la zone de travail pour décharger directement sur la péninsule." },
+    hob: { title: hobLocation === "wall" ? "Plaque murale" : "Rangement mural", size: "60 cm", text: hobLocation === "wall" ? "Hotte murale simple, cuisson éloignée des assises et appuis disponibles des deux côtés." : "La plaque passe sur la péninsule ; ce meuble devient un grand tiroir." },
+    sink: { title: sinkLocation === "wall" ? "Évier sous fenêtre" : "Rangement sous fenêtre", size: "90 cm", text: sinkLocation === "wall" ? "Lumière naturelle, lave-vaisselle immédiatement à proximité et aucun équipement devant la cheminée." : "L’évier passe sur la péninsule ; ce linéaire récupère du rangement." },
+    prep: { title: "Zone de préparation", size: `${prepWidth} × ${depth} cm`, text: "Surface principale entre le froid, le lavage et la cuisson. Les tiroirs accueillent ustensiles, casseroles et vaisselle quotidienne." },
+    tri: { title: "Poubelles et tri", size: "60 cm", text: "Sous le plan, entre la préparation et le lave-vaisselle pour limiter les déplacements." },
+    dishwasher: { title: "Lave-vaisselle", size: "60 cm", text: "Installé en bout de péninsule, au plus près de l’évier et sans couper la circulation principale." },
+    peninsulaSink: { title: "Évier sur péninsule", size: "90 cm", text: "Cette option libère le mur de la fenêtre, mais réduit la surface de préparation disponible sur la péninsule." },
+    fixed: { title: "Meuble coulissant prévu", size: "≈ 370 × 60 cm", text: "Rangement bas existant dans le projet, conservé accessible depuis le grand passage arrière." },
+  }), [depth, hobLocation, prepWidth, sinkLocation]);
+
+  const selectedInfo = moduleInfo[selectedModule as keyof typeof moduleInfo] ?? moduleInfo.prep;
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem("emmanuel-kitchen-config");
+      if (saved) {
+        const value = JSON.parse(saved);
+        if (Number.isFinite(value.length)) setLength(value.length);
+        if (Number.isFinite(value.depth)) setDepth(value.depth);
+        if (Number.isFinite(value.aisle)) setAisle(value.aisle);
+        if (Number.isFinite(value.stools)) setStools(value.stools);
+        if (value.sinkLocation === "wall" || value.sinkLocation === "peninsula") setSinkLocation(value.sinkLocation);
+        if (value.hobLocation === "wall" || value.hobLocation === "peninsula") setHobLocation(value.hobLocation);
+      }
+    } catch {
+      // Une préférence locale invalide ne doit jamais bloquer le configurateur.
+    }
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    window.localStorage.setItem("emmanuel-kitchen-config", JSON.stringify({ length, depth, aisle, stools, sinkLocation, hobLocation }));
+  }, [hydrated, length, depth, aisle, stools, sinkLocation, hobLocation]);
+
   function applyPreset(preset: Preset) {
     setLength(preset.length);
     setDepth(preset.depth);
     setAisle(preset.aisle);
     setStools(preset.stools);
   }
+
+  function resetConfiguration() {
+    applyPreset(presets[0]);
+    setSinkLocation("wall");
+    setHobLocation("wall");
+    setShowFlow(true);
+    setShowDimensions(true);
+    setSelectedModule("prep");
+  }
+
+  const selectable = (moduleId: string) => ({
+    moduleId,
+    selected: selectedModule === moduleId,
+    onSelect: setSelectedModule,
+  });
 
   return (
     <main>
@@ -135,7 +210,11 @@ export default function Home() {
             La cheminée reste libre. Ajuste les dimensions et les équipements : les passages se recalculent immédiatement.
           </p>
         </div>
-        <div className="header-mark" aria-hidden="true">EG</div>
+        <div className="header-tools">
+          <button type="button" className="text-action" onClick={resetConfiguration}>Réinitialiser</button>
+          <button type="button" className="print-action" onClick={() => window.print()}>Imprimer le plan</button>
+          <div className="header-mark" aria-hidden="true">EG</div>
+        </div>
       </header>
 
       <section className="workspace">
@@ -194,20 +273,30 @@ export default function Home() {
                 <text x="290" y="78" textAnchor="middle">Cheminée condamnée · mur libre</text>
               </g>
 
-              <PlanRect x={0} y={0} width={60} height={60} label="Garde-manger" compact="Réserve" fill={zoneColors.tall} />
-              <PlanRect x={60} y={0} width={60} height={60} label="Four + micro" compact="Four" fill={zoneColors.tall} />
-              <PlanRect x={120} y={0} width={60} height={60} label="Réfrigérateur" compact="Frigo" fill={zoneColors.tall} />
+              <PlanRect {...selectable("pantry")} x={0} y={0} width={60} height={60} label="Garde-manger" compact="Réserve" fill={zoneColors.tall} />
+              <PlanRect {...selectable("oven")} x={60} y={0} width={60} height={60} label="Four + micro" compact="Four" fill={zoneColors.tall} />
+              <PlanRect {...selectable("fridge")} x={120} y={0} width={60} height={60} label="Réfrigérateur" compact="Frigo" fill={zoneColors.tall} />
 
               <PlanRect x={380} y={0} width={30} height={60} label="Coulissant 30" compact="30" fill={zoneColors.low} />
-              <PlanRect x={410} y={0} width={60} height={60} label={hobLocation === "wall" ? "Plaque + hotte" : "Tiroirs 60"} compact={hobLocation === "wall" ? "Plaque" : "T60"} fill={zoneColors.low} />
+              <PlanRect {...selectable("hob")} x={410} y={0} width={60} height={60} label={hobLocation === "wall" ? "Plaque + hotte" : "Tiroirs 60"} compact={hobLocation === "wall" ? "Plaque" : "T60"} fill={zoneColors.low} />
               <PlanRect x={470} y={0} width={60} height={60} label="Meuble d’angle" compact="Angle" fill={zoneColors.low} />
-              <PlanRect x={470} y={60} width={60} height={90} label={sinkLocation === "wall" ? "Évier 90" : "Rangement 90"} compact={sinkLocation === "wall" ? "Évier" : "R90"} fill={zoneColors.low} />
+              <PlanRect {...selectable("sink")} x={470} y={60} width={60} height={90} label={sinkLocation === "wall" ? "Évier 90" : "Rangement 90"} compact={sinkLocation === "wall" ? "Évier" : "R90"} fill={zoneColors.low} />
               <PlanRect x={470} y={150} width={60} height={30} label="Joue 30" compact="30" fill={zoneColors.low} />
 
               <g className="peninsula-group">
-                <PlanRect x={peninsulaX} y={peninsulaY} width={prepWidth} height={depth} label="Grande préparation" compact="Préparation" fill={zoneColors.peninsula} />
-                <PlanRect x={peninsulaX + prepWidth} y={peninsulaY} width={60} height={depth} label="Poubelles / tri" compact="Tri" fill={zoneColors.peninsula} />
-                <PlanRect x={410} y={peninsulaY} width={60} height={depth} label={sinkLocation === "peninsula" ? "Évier + lave-vaisselle" : "Lave-vaisselle"} compact={sinkLocation === "peninsula" ? "Évier + LV" : "LV"} fill={zoneColors.peninsula} />
+                {sinkLocation === "wall" ? (
+                  <>
+                    <PlanRect {...selectable("prep")} x={peninsulaX} y={peninsulaY} width={prepWidth} height={depth} label="Grande préparation" compact="Préparation" fill={zoneColors.peninsula} />
+                    <PlanRect {...selectable("tri")} x={peninsulaX + prepWidth} y={peninsulaY} width={60} height={depth} label="Poubelles / tri" compact="Tri" fill={zoneColors.peninsula} />
+                    <PlanRect {...selectable("dishwasher")} x={410} y={peninsulaY} width={60} height={depth} label="Lave-vaisselle" compact="LV" fill={zoneColors.peninsula} />
+                  </>
+                ) : (
+                  <>
+                    <PlanRect {...selectable("prep")} x={peninsulaX} y={peninsulaY} width={prepWidth} height={depth} label="Préparation" compact="Prep." fill={zoneColors.peninsula} />
+                    <PlanRect {...selectable("dishwasher")} x={320} y={peninsulaY} width={60} height={depth} label="Lave-vaisselle" compact="LV" fill={zoneColors.peninsula} />
+                    <PlanRect {...selectable("peninsulaSink")} x={380} y={peninsulaY} width={90} height={depth} label="Évier 90" compact="Évier" fill={zoneColors.peninsula} />
+                  </>
+                )}
                 {hobLocation === "peninsula" && (
                   <g className="hob-symbol" transform={`translate(${peninsulaX + prepWidth * 0.62} ${peninsulaY + depth / 2})`}>
                     <rect x="-30" y="-20" width="60" height="40" rx="5" />
@@ -222,7 +311,7 @@ export default function Home() {
                 return <circle key={index} cx={stoolX} cy={peninsulaY + depth + 22} r="12" className="stool" />;
               })}
 
-              <PlanRect x={160} y={440} width={370} height={60} label="Meuble étagère à portes coulissantes prévu" compact="Meuble coulissant" fill={zoneColors.fixed} />
+              <PlanRect {...selectable("fixed")} x={160} y={440} width={370} height={60} label="Meuble étagère à portes coulissantes prévu" compact="Meuble coulissant" fill={zoneColors.fixed} />
 
               {showFlow && (
                 <g className="work-flow">
@@ -306,15 +395,40 @@ export default function Home() {
             onChange={(value) => setHobLocation(value as Location)}
           />
 
-          <div className={`advice ${workComfort && rearComfort ? "advice-good" : "advice-warn"}`}>
-            <span>{workComfort && rearComfort ? "Implantation confortable" : "Passages à surveiller"}</span>
+          <div className="module-inspector">
+            <span className="section-kicker">Module sélectionné</span>
+            <div className="module-title-row">
+              <h3>{selectedInfo.title}</h3>
+              <strong>{selectedInfo.size}</strong>
+            </div>
+            <p>{selectedInfo.text}</p>
+            <small>Clique sur un meuble du plan pour afficher sa fiche.</small>
+          </div>
+
+          <div className={`advice ${workComfort && rearComfort && equipmentComfort ? "advice-good" : "advice-warn"}`}>
+            <span>{workComfort && rearComfort && equipmentComfort ? "Implantation confortable" : "Configuration à ajuster"}</span>
             <p>
-              {workComfort && rearComfort
-                ? "Les deux circulations principales restent au-dessus des seuils conseillés."
-                : "Essaie le préréglage Recommandée ou réduis la profondeur de la péninsule."}
+              {!equipmentComfort
+                ? "Évier et plaque sur la même péninsule laissent trop peu de préparation. Replace au moins l’un des deux sur le mur."
+                : workComfort && rearComfort
+                  ? "Les deux circulations principales restent au-dessus des seuils conseillés."
+                  : "Essaie le préréglage Recommandée ou réduis la profondeur de la péninsule."}
             </p>
           </div>
         </aside>
+      </section>
+
+      <section className="decision-summary" aria-labelledby="summary-title">
+        <div>
+          <p className="section-kicker">Synthèse actuelle</p>
+          <h2 id="summary-title">Une cuisine qui garde les circulations hors de la zone de travail.</h2>
+        </div>
+        <ul>
+          <li><strong>{length} × {depth} cm</strong><span>Péninsule</span></li>
+          <li><strong>{aisle} cm</strong><span>Entre cuisine et péninsule</span></li>
+          <li><strong>{rearClearance} cm</strong><span>Derrière les assises</span></li>
+          <li><strong>0 meuble</strong><span>Devant la cheminée</span></li>
+        </ul>
       </section>
     </main>
   );
