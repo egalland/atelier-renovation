@@ -98,6 +98,17 @@ const SAVES_KEY = "atelier-renovation-saves-v1";
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 const round = (value: number, digits = 1) => Math.round(value * 10 ** digits) / 10 ** digits;
+const fitViewBoxToAspect = (view: ViewBox, aspect: number): ViewBox => {
+  if (!Number.isFinite(aspect) || aspect <= 0) return view;
+  const currentAspect = view.width / view.height;
+  if (Math.abs(currentAspect - aspect) < 0.0001) return view;
+  if (currentAspect < aspect) {
+    const width = view.height * aspect;
+    return { x: view.x - (width - view.width) / 2, y: view.y, width, height: view.height };
+  }
+  const height = view.width / aspect;
+  return { x: view.x, y: view.y - (height - view.height) / 2, width: view.width, height };
+};
 const formatDate = (value: string) => {
   const [year, month, day] = value.split("-");
   return year && month && day ? `${day}/${month}/${year}` : value;
@@ -407,6 +418,7 @@ export default function Home() {
   const [notice, setNotice] = useState("Toutes les modifications sont enregistrées localement");
   const [hydrated, setHydrated] = useState(false);
   const [viewport, setViewport] = useState<ViewBox | null>(null);
+  const [canvasAspect, setCanvasAspect] = useState(16 / 10);
   const [isPanning, setIsPanning] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [draggedObjectId, setDraggedObjectId] = useState<string | null>(null);
@@ -424,17 +436,19 @@ export default function Home() {
     const maxX = Math.max(600, ...finite.map((point) => point.x)); const maxY = Math.max(550, ...finite.map((point) => point.y)); const padding = 120;
     return { x: minX - padding, y: minY - padding, width: Math.max(770, maxX - minX + padding * 2), height: Math.max(740, maxY - minY + padding * 2) };
   }, [existing, lining, objects, routes, fixtures]);
-  const activeView = viewport ?? bounds;
-  const zoomPercent = Math.round(bounds.width / activeView.width * 100);
+  const fittedBounds = useMemo(() => fitViewBoxToAspect(bounds, canvasAspect), [bounds, canvasAspect]);
+  const activeView = useMemo(() => fitViewBoxToAspect(viewport ?? bounds, canvasAspect), [viewport, bounds, canvasAspect]);
+  const zoomPercent = Math.round(fittedBounds.width / activeView.width * 100);
   const pointFromEvent = useCallback((event: { clientX: number; clientY: number }) => {
     const svg = svgRef.current; const matrix = svg?.getScreenCTM(); if (!svg || !matrix) return null;
     const point = svg.createSVGPoint(); point.x = event.clientX; point.y = event.clientY; return point.matrixTransform(matrix.inverse());
   }, []);
   const zoomView = useCallback((factor: number, anchor?: Point) => {
     setViewport((current) => {
-      const view = current ?? bounds;
-      const minWidth = bounds.width / 8;
-      const maxWidth = bounds.width * 4;
+      const view = fitViewBoxToAspect(current ?? bounds, canvasAspect);
+      const reference = fitViewBoxToAspect(bounds, canvasAspect);
+      const minWidth = reference.width / 8;
+      const maxWidth = reference.width * 4;
       const nextWidth = clamp(view.width * factor, minWidth, maxWidth);
       const appliedFactor = nextWidth / view.width;
       if (Math.abs(appliedFactor - 1) < 0.0001) return view;
@@ -446,7 +460,7 @@ export default function Home() {
         height: view.height * appliedFactor,
       };
     });
-  }, [bounds]);
+  }, [bounds, canvasAspect]);
 
   const routeTotals = useMemo(() => ({
     electric: routes.filter((route) => route.kind === "electric").reduce((sum, route) => sum + routeLength(route, fixtures, objects, existing, lining), 0),
@@ -531,8 +545,12 @@ export default function Home() {
     const followPointer = (event: globalThis.PointerEvent) => {
       cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
+        const horizontal = event.clientX / Math.max(window.innerWidth, 1) - 0.5;
+        const vertical = event.clientY / Math.max(window.innerHeight, 1) - 0.5;
         root.style.setProperty("--pointer-x", `${event.clientX}px`);
         root.style.setProperty("--pointer-y", `${event.clientY}px`);
+        root.style.setProperty("--pointer-dx", `${horizontal * 34}px`);
+        root.style.setProperty("--pointer-dy", `${vertical * 26}px`);
       });
     };
     window.addEventListener("pointermove", followPointer, { passive: true });
@@ -542,6 +560,20 @@ export default function Home() {
     const syncFullscreen = () => setIsFullscreen(document.fullscreenElement === canvasPanelRef.current);
     document.addEventListener("fullscreenchange", syncFullscreen);
     return () => document.removeEventListener("fullscreenchange", syncFullscreen);
+  }, []);
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg || typeof ResizeObserver === "undefined") return;
+    const updateAspect = () => {
+      const { width, height } = svg.getBoundingClientRect();
+      if (width <= 0 || height <= 0) return;
+      const next = width / height;
+      setCanvasAspect((current) => Math.abs(current - next) < 0.001 ? current : next);
+    };
+    updateAspect();
+    const observer = new ResizeObserver(updateAspect);
+    observer.observe(svg);
+    return () => observer.disconnect();
   }, []);
   useEffect(() => {
     const svg = svgRef.current;
@@ -824,7 +856,11 @@ export default function Home() {
 
           <div className="drawing-stage">
             <svg ref={svgRef} className={`${routeWallWaypointMode ? "waypoint-mode" : ""} ${isPanning ? "is-panning" : ""}`} viewBox={`${activeView.x} ${activeView.y} ${activeView.width} ${activeView.height}`} role="img" aria-label="Plan interactif de rénovation. Utilisez la molette pour zoomer et faites glisser le fond pour vous déplacer." onContextMenu={openPlanContextMenu} onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
-              <defs><pattern id="cad-grid" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M10 0H0V10" fill="none" /></pattern><filter id="soft-shadow"><feDropShadow dx="0" dy="3" stdDeviation="3" floodOpacity=".16" /></filter></defs>
+              <defs>
+                <pattern id="cad-grid-minor" width="10" height="10" patternUnits="userSpaceOnUse"><path className="cad-grid-minor" d="M10 0H0V10" fill="none" /></pattern>
+                <pattern id="cad-grid" width="50" height="50" patternUnits="userSpaceOnUse"><rect width="50" height="50" fill="url(#cad-grid-minor)" /><path className="cad-grid-major" d="M50 0H0V50" fill="none" /></pattern>
+                <filter id="soft-shadow"><feDropShadow dx="0" dy="3" stdDeviation="3" floodOpacity=".16" /></filter>
+              </defs>
               <rect x={activeView.x} y={activeView.y} width={activeView.width} height={activeView.height} className="canvas-bg" onPointerDown={beginCanvasPan} />
               <rect x={activeView.x} y={activeView.y} width={activeView.width} height={activeView.height} fill="url(#cad-grid)" pointerEvents="none" />
               <path d={wallPath(existing)} className="room-fill" pointerEvents="none" />
