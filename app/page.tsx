@@ -207,7 +207,9 @@ function squareNearOrthogonalWalls(points: Point[], tolerance: number) {
     const previous = lines[(index - 1 + lines.length) % lines.length];
     const current = lines[index];
     const intersection = lineIntersection(previous.point, previous.direction, current.point, current.direction);
-    return intersection && Number.isFinite(intersection.x) && Number.isFinite(intersection.y)
+    const localScale = Math.max(segmentLength(points, (index - 1 + points.length) % points.length), segmentLength(points, index), 25);
+    const reasonable = intersection && Math.hypot(intersection.x - point.x, intersection.y - point.y) <= localScale * 4;
+    return intersection && reasonable && Number.isFinite(intersection.x) && Number.isFinite(intersection.y)
       ? { x: round(intersection.x), y: round(intersection.y) }
       : { ...point };
   });
@@ -292,7 +294,10 @@ export default function Home() {
 
   const bounds = useMemo(() => {
     const all = [...existing, ...lining, ...objects.flatMap((object) => [{ x: object.x, y: object.y }, { x: object.x + object.w, y: object.y + object.h }])];
-    return { maxX: Math.max(600, ...all.map((point) => point.x)) + 50, maxY: Math.max(550, ...all.map((point) => point.y)) + 50 };
+    const finite = all.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+    const minX = Math.min(0, ...finite.map((point) => point.x)); const minY = Math.min(0, ...finite.map((point) => point.y));
+    const maxX = Math.max(600, ...finite.map((point) => point.x)); const maxY = Math.max(550, ...finite.map((point) => point.y)); const padding = 55;
+    return { x: minX - padding, y: minY - padding, width: Math.max(710, maxX - minX + padding * 2), height: Math.max(660, maxY - minY + padding * 2) };
   }, [existing, lining, objects]);
 
   const routeTotals = useMemo(() => ({
@@ -488,10 +493,10 @@ export default function Home() {
           </div>
 
           <div className="drawing-stage">
-            <svg ref={svgRef} viewBox={`-55 -55 ${bounds.maxX + 60} ${bounds.maxY + 60}`} role="img" aria-label="Plan interactif de rénovation" onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
+            <svg ref={svgRef} viewBox={`${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}`} role="img" aria-label="Plan interactif de rénovation" onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
               <defs><pattern id="cad-grid" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M10 0H0V10" fill="none" /></pattern><filter id="soft-shadow"><feDropShadow dx="0" dy="3" stdDeviation="3" floodOpacity=".16" /></filter></defs>
-              <rect x="-40" y="-40" width={bounds.maxX + 20} height={bounds.maxY + 20} className="canvas-bg" onPointerDown={() => clearSelection()} />
-              <rect x="-40" y="-40" width={bounds.maxX + 20} height={bounds.maxY + 20} fill="url(#cad-grid)" pointerEvents="none" />
+              <rect x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} className="canvas-bg" onPointerDown={() => clearSelection()} />
+              <rect x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} fill="url(#cad-grid)" pointerEvents="none" />
               <path d={wallPath(existing)} className="room-fill" pointerEvents="none" />
 
               {existing.map((_, index) => { const wall = segment(existing, index); const selected = selectedWall?.layer === "existing" && selectedWall.index === index; return <g key={`existing-${index}`}><line className="wall-hit" x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedWall({ layer: "existing", index }); clearSelection("wall"); }} /><line className={`wall-line existing-wall ${selected ? "selected" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" />{showDimensions && <g className="wall-dimension" transform={`translate(${(wall.a.x + wall.b.x) / 2},${(wall.a.y + wall.b.y) / 2})`}><rect x="-23" y="-9" width="46" height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{Math.round(segmentLength(existing, index))} cm</text></g>}</g>; })}
