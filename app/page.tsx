@@ -103,6 +103,7 @@ type DragState =
 const DRAFT_KEY = "atelier-renovation-draft-v1";
 const PRODUCTS_KEY = "atelier-renovation-products-v1";
 const SAVES_KEY = "atelier-renovation-saves-v1";
+const PRINT_ASPECT = 281 / 194;
 const uid = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 const round = (value: number, digits = 1) => Math.round(value * 10 ** digits) / 10 ** digits;
@@ -497,6 +498,7 @@ export default function Home() {
   const [canvasAspect, setCanvasAspect] = useState(16 / 10);
   const [isPanning, setIsPanning] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isPrinting, setIsPrinting] = useState(false);
   const [draggedObjectId, setDraggedObjectId] = useState<string | null>(null);
   const [newProduct, setNewProduct] = useState<Omit<Product, "id">>({ name: "", reference: "", category: "consommables", store: "", url: "", price: 0, coverage: 1, coverageUnit: "u", packLabel: "unité", checkedAt: new Date().toISOString().slice(0, 10) });
 
@@ -524,6 +526,42 @@ export default function Home() {
     const last = measurementDraft.at(-1)!; return Math.hypot(last.x - measurementPreview.x, last.y - measurementPreview.y) < 0.1 ? measurementDraft : [...measurementDraft, measurementPreview];
   }, [measurementDraft, measurementPreview]);
   const activeDimensionCount = Object.values(dimensionVisibility).filter(Boolean).length;
+  const visibleFixtures = useMemo(() => fixtures.filter((fixture) => mode === "plan" ? fixtureMeta[fixture.kind].opening : mode === "networks" ? showAllNetworks ? Boolean(fixtureNetwork(fixture.kind) || fixtureSource(fixture.kind)) : fixtureNetwork(fixture.kind) === networkFilter || fixtureSource(fixture.kind) === networkFilter : mode === "layout" ? fixtureMeta[fixture.kind].opening : true), [fixtures, mode, networkFilter, showAllNetworks]);
+
+  const printBounds = useMemo(() => {
+    let minX = Number.POSITIVE_INFINITY; let minY = Number.POSITIVE_INFINITY; let maxX = Number.NEGATIVE_INFINITY; let maxY = Number.NEGATIVE_INFINITY;
+    const includePoint = (point: Point, radius = 0) => { if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return; minX = Math.min(minX, point.x - radius); minY = Math.min(minY, point.y - radius); maxX = Math.max(maxX, point.x + radius); maxY = Math.max(maxY, point.y + radius); };
+    const includeBox = (x: number, y: number, width: number, height: number) => { includePoint({ x, y }); includePoint({ x: x + width, y: y + height }); };
+
+    existing.forEach((point) => includePoint(point, 14)); lining.forEach((point) => includePoint(point, 8));
+    if (dimensionVisibility.existing) wallDimensionLayout.existing.forEach((label) => includeBox(label.x - label.width / 2, label.y - 11, label.width, 22));
+    if (dimensionVisibility.lining) wallDimensionLayout.lining.forEach((label) => includeBox(label.x - label.width / 2, label.y - 11, label.width, 22));
+
+    visibleFixtures.forEach((fixture) => {
+      const position = fixturePosition(fixture, existing, lining); const opening = fixtureMeta[fixture.kind].opening;
+      includePoint(position, opening ? fixture.width / 2 + 18 : 14);
+      if (showPrices && fixture.showPrice !== false && (fixture.unitPrice ?? 0) > 0) includeBox(position.x - 29, position.y + 11, 58, 18);
+    });
+
+    if (mode !== "plan") objects.forEach((object) => {
+      includeBox(object.x - 3, object.y - 3, object.w + 6, object.h + 6);
+      if (showPrices && object.showPrice !== false && (object.unitPrice ?? 0) > 0) includeBox(object.x + object.w / 2 - 29, object.y + object.h + 3, 58, 18);
+    });
+
+    if (mode === "networks") visibleRoutes.forEach((route) => {
+      const routePoints = effectiveRoutePoints(route, fixtures, objects, existing, lining); routePoints.forEach((point) => includePoint(point, 9));
+      const label = networkDimensionLayout.get(route.id); if (dimensionVisibility.networks && label) { includeBox(label.x - label.width / 2, label.y - 12, label.width, 24); includePoint(label.anchor, 3); }
+      if (!route.targetFixtureId && !route.targetObjectId) { const terminal = routePoints.at(-1); if (terminal) includeBox(terminal.x - 11, terminal.y - 27, 96, 39); }
+    });
+
+    if (dimensionVisibility.measurements) measurements.forEach((measurement) => {
+      measurement.points.forEach((point) => includePoint(point, 5)); const summary = measurementSummary(measurement.points); const midpoint = polylineMidpoint(measurement.points); const width = Math.max(58, summary.length * 4.35 + 16); includeBox(midpoint.x - width / 2, midpoint.y - 25, width, 20);
+    });
+
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) return { x: 0, y: 0, width: 600, height: 550 };
+    const padding = 24;
+    return { x: minX - padding, y: minY - padding, width: Math.max(1, maxX - minX + padding * 2), height: Math.max(1, maxY - minY + padding * 2) };
+  }, [existing, lining, visibleFixtures, objects, mode, visibleRoutes, fixtures, dimensionVisibility, wallDimensionLayout, networkDimensionLayout, measurements, showPrices]);
 
   const bounds = useMemo(() => {
     const all = [...existing, ...lining, ...fixtures.map((fixture) => fixturePosition(fixture, existing, lining)), ...objects.flatMap((object) => [{ x: object.x, y: object.y }, { x: object.x + object.w, y: object.y + object.h }]), ...routes.flatMap((route) => effectiveRoutePoints(route, fixtures, objects, existing, lining)), ...measurements.flatMap((measurement) => measurement.points)];
@@ -533,7 +571,8 @@ export default function Home() {
     return { x: minX - padding, y: minY - padding, width: Math.max(770, maxX - minX + padding * 2), height: Math.max(740, maxY - minY + padding * 2) };
   }, [existing, lining, objects, routes, fixtures, measurements]);
   const fittedBounds = useMemo(() => fitViewBoxToAspect(bounds, canvasAspect), [bounds, canvasAspect]);
-  const activeView = useMemo(() => fitViewBoxToAspect(viewport ?? bounds, canvasAspect), [viewport, bounds, canvasAspect]);
+  const printView = useMemo(() => fitViewBoxToAspect(printBounds, PRINT_ASPECT), [printBounds]);
+  const activeView = useMemo(() => isPrinting ? printView : fitViewBoxToAspect(viewport ?? bounds, canvasAspect), [isPrinting, printView, viewport, bounds, canvasAspect]);
   const zoomPercent = Math.round(fittedBounds.width / activeView.width * 100);
   const pointFromEvent = useCallback((event: { clientX: number; clientY: number }) => {
     const svg = svgRef.current; const matrix = svg?.getScreenCTM(); if (!svg || !matrix) return null;
@@ -658,6 +697,12 @@ export default function Home() {
     return () => document.removeEventListener("fullscreenchange", syncFullscreen);
   }, []);
   useEffect(() => {
+    const preparePrint = () => { setContextMenu(null); setIsPrinting(true); };
+    const restoreScreenView = () => setIsPrinting(false);
+    window.addEventListener("beforeprint", preparePrint); window.addEventListener("afterprint", restoreScreenView);
+    return () => { window.removeEventListener("beforeprint", preparePrint); window.removeEventListener("afterprint", restoreScreenView); };
+  }, []);
+  useEffect(() => {
     const svg = svgRef.current;
     if (!svg || typeof ResizeObserver === "undefined") return;
     const updateAspect = () => {
@@ -710,6 +755,10 @@ export default function Home() {
     } catch {
       setNotice("Le plein écran n’est pas disponible dans ce navigateur");
     }
+  }
+  function printPlan() {
+    setContextMenu(null); setIsPrinting(true);
+    requestAnimationFrame(() => requestAnimationFrame(() => window.print()));
   }
   function clearSelection(except?: "wall" | "fixture" | "object" | "route" | "route-point" | "measurement") {
     if (except !== "wall") setSelectedWall(null); if (except !== "fixture") setSelectedFixtureId(null); if (except !== "object") setSelectedObjectId(null); if (except !== "route" && except !== "route-point") setSelectedRouteId(null); if (except !== "route-point") setSelectedRoutePoint(null); if (except !== "measurement") setSelectedMeasurementId(null);
@@ -970,7 +1019,6 @@ export default function Home() {
   const routePath = (route: NetworkRoute) => effectiveRoutePoints(route, fixtures, objects, existing, lining).map((point, index) => `${index ? "L" : "M"}${point.x},${point.y}`).join(" ");
   const euros = (value: number) => new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(value);
   const contextMeasurePoint = contextMenu ? contextTargetPoint(contextMenu.target) : null;
-  const visibleFixtures = fixtures.filter((fixture) => mode === "plan" ? fixtureMeta[fixture.kind].opening : mode === "networks" ? showAllNetworks ? Boolean(fixtureNetwork(fixture.kind) || fixtureSource(fixture.kind)) : fixtureNetwork(fixture.kind) === networkFilter || fixtureSource(fixture.kind) === networkFilter : mode === "layout" ? fixtureMeta[fixture.kind].opening : true);
   const renderFixture = (fixture: WallFixture) => {
     const points = fixture.layer === "existing" ? existing : lining; const wall = segment(points, Math.min(fixture.wallIndex, points.length - 1)); const position = fixturePosition(fixture, existing, lining); const length = Math.hypot(wall.b.x - wall.a.x, wall.b.y - wall.a.y) || 1; const tx = (wall.b.x - wall.a.x) / length; const ty = (wall.b.y - wall.a.y) / length; const orientation = signedArea(points) >= 0 ? 1 : -1; const labelNormal = { x: -ty * orientation, y: tx * orientation }; const half = fixture.width / 2; const opening = fixtureMeta[fixture.kind].opening; const selected = selectedFixtureId === fixture.id;
     return <g key={fixture.id} className={`wall-fixture ${opening ? "opening-fixture" : "technical-fixture"} ${fixture.freePosition ? "free-fixture" : ""} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={fixture.name} onContextMenu={(event) => openContextMenu(event, { type: "fixture", id: fixture.id })} onPointerDown={(event) => beginFixtureDrag(event, fixture)}>{opening ? <><line x1={position.x - tx * half} y1={position.y - ty * half} x2={position.x + tx * half} y2={position.y + ty * half} stroke={fixtureMeta[fixture.kind].color} /><text x={position.x + labelNormal.x * 17} y={position.y + labelNormal.y * 17} textAnchor="middle" dominantBaseline="middle">{fixture.name}</text></> : <><circle cx={position.x} cy={position.y} r="9" fill={fixtureMeta[fixture.kind].color} /><text x={position.x} y={position.y} textAnchor="middle" dominantBaseline="middle">{fixtureMeta[fixture.kind].short}</text>{fixture.quantity > 1 && <text className="fixture-quantity" x={position.x + 9} y={position.y - 9}>{fixture.quantity}</text>}</>}{showPrices && fixture.showPrice !== false && (fixture.unitPrice ?? 0) > 0 && <g className="price-tag" transform={`translate(${position.x},${position.y + 20})`}><rect x="-27" y="-8" width="54" height="16" rx="7" /><text textAnchor="middle" dominantBaseline="middle">{euros((fixture.unitPrice ?? 0) * fixture.quantity)}</text></g>}</g>;
@@ -1002,7 +1050,7 @@ export default function Home() {
               {measureMode && <><label className="measurement-snap-toggle"><input type="checkbox" checked={measurementSnap} onChange={(event) => setMeasurementSnap(event.currentTarget.checked)} /> Aimant mesure</label><button type="button" className="finish-measure-button" disabled={measurementDraft.length < 2} onClick={finishMeasurement}>Terminer <kbd>Entrée</kbd></button></>}
               <label><input type="checkbox" checked={showPrices} onChange={(event) => setShowPrices(event.target.checked)} /> Prix</label>
               {mode === "plan" ? <label><input type="checkbox" checked={orthogonalSnap} onChange={(event) => setOrthogonalSnap(event.target.checked)} /> Aimant murs 90°</label> : <label><input type="checkbox" checked={elementSnap} onChange={(event) => setElementSnap(event.target.checked)} /> Aimant éléments 5 cm</label>}
-              <button type="button" onClick={() => window.print()}>Imprimer</button><span className="editor-shortcuts">M · Entrée · Échap · Clic droit · Suppr</span>
+              <button type="button" onClick={printPlan}>Imprimer</button><span className="editor-shortcuts">M · Entrée · Échap · Clic droit · Suppr</span>
             </div>
             <div className="canvas-navigation" aria-label="Navigation du plan">
               <button type="button" className="zoom-button" aria-label="Dézoomer" title="Dézoomer" onClick={() => zoomView(1.2)}>−</button>
