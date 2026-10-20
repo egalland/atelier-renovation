@@ -35,9 +35,9 @@ type WallFixture = {
   showPrice?: boolean;
 };
 
-type ObjectKind = "cabinet" | "tall" | "worktop" | "appliance" | "sanitary" | "table" | "radiator" | "custom";
-type PlanObject = { id: string; kind: ObjectKind; name: string; x: number; y: number; w: number; h: number; unitPrice?: number; showPrice?: boolean };
-type NetworkRoute = { id: string; kind: NetworkKind; name: string; points: RoutePoint[]; sourceFixtureId?: string; targetFixtureId?: string };
+type ObjectKind = "cabinet" | "tall" | "worktop" | "appliance" | "dishwasher" | "sanitary" | "table" | "radiator" | "custom";
+type PlanObject = { id: string; kind: ObjectKind; name: string; x: number; y: number; w: number; h: number; connections?: NetworkKind[]; unitPrice?: number; showPrice?: boolean };
+type NetworkRoute = { id: string; kind: NetworkKind; name: string; points: RoutePoint[]; sourceFixtureId?: string; targetFixtureId?: string; targetObjectId?: string };
 
 type ProductCategory = "plomberie" | "electricite" | "ossature" | "isolation" | "plaques" | "carrelage" | "consommables";
 type Product = {
@@ -91,7 +91,7 @@ const formatDate = (value: string) => {
 };
 const copyPoints = <T extends Point>(points: T[]): T[] => points.map((point) => ({ ...point }));
 const copyFixtures = (fixtures: WallFixture[]) => fixtures.map((fixture) => ({ ...fixture }));
-const copyObjects = (objects: PlanObject[]) => objects.map((object) => ({ ...object }));
+const copyObjects = (objects: PlanObject[]) => objects.map((object) => ({ ...object, connections: object.connections ? [...object.connections] : undefined }));
 const copyRoutes = (routes: NetworkRoute[]) => routes.map((route) => ({ ...route, points: copyPoints(route.points) }));
 
 const defaultExisting: Point[] = [
@@ -114,12 +114,13 @@ const fixtureMeta: Record<FixtureKind, { label: string; short: string; color: st
   "source-hot": { label: "Départ eau chaude", short: "EC", color: "#dc2626", source: "hot" },
 };
 
-const objectMeta: Record<ObjectKind, { label: string; w: number; h: number; color: string }> = {
+const objectMeta: Record<ObjectKind, { label: string; w: number; h: number; color: string; connections?: NetworkKind[] }> = {
   cabinet: { label: "Meuble bas", w: 60, h: 60, color: "#64748b" },
   tall: { label: "Colonne", w: 60, h: 60, color: "#475569" },
   worktop: { label: "Plan de travail", w: 180, h: 65, color: "#0f766e" },
-  appliance: { label: "Électroménager", w: 60, h: 60, color: "#334155" },
-  sanitary: { label: "Équipement sanitaire", w: 90, h: 60, color: "#0891b2" },
+  appliance: { label: "Électroménager", w: 60, h: 60, color: "#334155", connections: ["electric"] },
+  dishwasher: { label: "Lave-vaisselle", w: 60, h: 60, color: "#0369a1", connections: ["electric", "cold"] },
+  sanitary: { label: "Équipement sanitaire", w: 90, h: 60, color: "#0891b2", connections: ["cold", "hot"] },
   table: { label: "Table / îlot", w: 160, h: 80, color: "#7c3aed" },
   radiator: { label: "Radiateur", w: 100, h: 18, color: "#ef4444" },
   custom: { label: "Volume libre", w: 100, h: 60, color: "#2563eb" },
@@ -249,29 +250,109 @@ function fixtureNetwork(kind: FixtureKind) { return fixtureMeta[kind].network; }
 function fixtureSource(kind: FixtureKind) { return fixtureMeta[kind].source; }
 function fixturePosition(fixture: WallFixture, existing: Point[], lining: Point[]) { const points = fixture.layer === "existing" ? existing : lining; return pointOnSegment(points, Math.min(fixture.wallIndex, points.length - 1), fixture.offset); }
 function networkName(kind: NetworkKind) { return kind === "electric" ? "Électricité" : kind === "cold" ? "Eau froide" : "Eau chaude"; }
-function automaticRoutes(fixtures: WallFixture[], existing: Point[], lining: Point[]) {
-  return fixtures.flatMap((target) => {
+function wallAnchor(point: Point, lining: Point[]): RoutePoint {
+  const nearest = nearestWallProjection(point, lining);
+  if (!nearest) return { ...point };
+  return { ...nearest.point, wallIndex: nearest.wallIndex, wallOffset: nearest.wallOffset, wallLayer: "lining" };
+}
+function storedWallAnchor(point: RoutePoint, lining: Point[]): RoutePoint {
+  if (point.wallIndex === undefined) return wallAnchor(point, lining);
+  const wallIndex = Math.round(clamp(point.wallIndex, 0, Math.max(0, lining.length - 1)));
+  const wallOffset = clamp(point.wallOffset ?? 0.5, 0, 1);
+  return { ...pointOnSegment(lining, wallIndex, wallOffset), wallIndex, wallOffset, wallLayer: "lining" };
+}
+function fixtureWallAnchor(fixture: WallFixture, existing: Point[], lining: Point[]): RoutePoint {
+  return wallAnchor(fixturePosition(fixture, existing, lining), lining);
+}
+function objectCenter(object: PlanObject) { return { x: object.x + object.w / 2, y: object.y + object.h / 2 }; }
+function objectWallAnchor(object: PlanObject, lining: Point[]) { return wallAnchor(objectCenter(object), lining); }
+function objectConnectionPoint(object: PlanObject, lining: Point[]): Point {
+  const center = objectCenter(object); const anchor = objectWallAnchor(object, lining); const dx = anchor.x - center.x; const dy = anchor.y - center.y;
+  if (Math.abs(dx) + Math.abs(dy) < 0.001) return center;
+  const scaleX = Math.abs(dx) > 0.001 ? object.w / 2 / Math.abs(dx) : Number.POSITIVE_INFINITY;
+  const scaleY = Math.abs(dy) > 0.001 ? object.h / 2 / Math.abs(dy) : Number.POSITIVE_INFINITY;
+  const scale = Math.min(scaleX, scaleY);
+  return { x: center.x + dx * scale, y: center.y + dy * scale };
+}
+function wallPathBetween(lining: Point[], from: RoutePoint, to: RoutePoint) {
+  if (lining.length < 2 || from.wallIndex === undefined || to.wallIndex === undefined) return [{ x: from.x, y: from.y }, { x: to.x, y: to.y }];
+  const lengths = lining.map((_, index) => segmentLength(lining, index));
+  const cumulative = [0]; lengths.forEach((length) => cumulative.push(cumulative[cumulative.length - 1] + length));
+  const total = cumulative[cumulative.length - 1] || 1;
+  const fromDistance = cumulative[from.wallIndex] + lengths[from.wallIndex] * (from.wallOffset ?? 0.5);
+  const toDistance = cumulative[to.wallIndex] + lengths[to.wallIndex] * (to.wallOffset ?? 0.5);
+  const forwardDistance = (toDistance - fromDistance + total) % total;
+  const backwardDistance = (fromDistance - toDistance + total) % total;
+  if (Math.min(forwardDistance, backwardDistance) < 0.001) return [{ x: from.x, y: from.y }, { x: to.x, y: to.y }];
+  const forward = forwardDistance <= backwardDistance;
+  const destination = forward
+    ? toDistance <= fromDistance ? toDistance + total : toDistance
+    : toDistance >= fromDistance ? toDistance - total : toDistance;
+  const vertices = lining.flatMap((point, index) => [-1, 0, 1].map((cycle) => ({ point, distance: cumulative[index] + cycle * total })))
+    .filter((entry) => forward
+      ? entry.distance > fromDistance + 0.001 && entry.distance < destination - 0.001
+      : entry.distance < fromDistance - 0.001 && entry.distance > destination + 0.001)
+    .sort((a, b) => forward ? a.distance - b.distance : b.distance - a.distance)
+    .map((entry) => ({ ...entry.point }));
+  return [{ x: from.x, y: from.y }, ...vertices, { x: to.x, y: to.y }];
+}
+function dedupePath(points: Point[]) {
+  return points.filter((point, index) => index === 0 || Math.hypot(point.x - points[index - 1].x, point.y - points[index - 1].y) > 0.01);
+}
+function automaticRoutes(fixtures: WallFixture[], objects: PlanObject[], existing: Point[], lining: Point[]) {
+  const fixtureRoutes = fixtures.flatMap((target) => {
     const kind = fixtureNetwork(target.kind); if (!kind) return [];
     const source = fixtures.find((fixture) => fixtureSource(fixture.kind) === kind); if (!source) return [];
-    const start = fixturePosition(source, existing, lining); const end = fixturePosition(target, existing, lining);
-    return [{ id: `auto-${kind}-${target.id}`, kind, name: `${networkName(kind)} · ${target.name}`, sourceFixtureId: source.id, targetFixtureId: target.id, points: [start, { x: start.x, y: end.y }, end] } as NetworkRoute];
+    const start = fixtureWallAnchor(source, existing, lining); const end = fixtureWallAnchor(target, existing, lining);
+    return [{ id: `auto-${kind}-${target.id}`, kind, name: `${networkName(kind)} · ${target.name}`, sourceFixtureId: source.id, targetFixtureId: target.id, points: [start, end] } as NetworkRoute];
+  });
+  const objectRoutes = objects.flatMap((object) => (object.connections ?? []).flatMap((kind) => {
+    const source = fixtures.find((fixture) => fixtureSource(fixture.kind) === kind); if (!source) return [];
+    const start = fixtureWallAnchor(source, existing, lining); const end = objectConnectionPoint(object, lining);
+    return [{ id: `auto-${kind}-object-${object.id}`, kind, name: `${networkName(kind)} · ${object.name}`, sourceFixtureId: source.id, targetObjectId: object.id, points: [start, end] } as NetworkRoute];
+  }));
+  return [...fixtureRoutes, ...objectRoutes];
+}
+function mergeAutomaticRoutes(current: NetworkRoute[], generated: NetworkRoute[]) {
+  const preservedManual = current.filter((route) => !route.id.startsWith("auto-"));
+  return [...generated.map((route) => {
+    const previous = current.find((entry) => entry.id === route.id);
+    if (!previous) return route;
+    const guidedPoints = previous.points.slice(1, -1).filter((point) => point.wallIndex !== undefined);
+    return { ...route, name: previous.name, points: [route.points[0], ...copyPoints(guidedPoints), route.points[route.points.length - 1]] };
+  }), ...preservedManual];
+}
+function effectiveRoutePoints(route: NetworkRoute, fixtures: WallFixture[], objects: PlanObject[], existing: Point[], lining: Point[]) {
+  const source = fixtures.find((fixture) => fixture.id === route.sourceFixtureId);
+  const target = fixtures.find((fixture) => fixture.id === route.targetFixtureId);
+  const targetObject = objects.find((object) => object.id === route.targetObjectId);
+  const firstStored = route.points[0] ?? lining[0] ?? { x: 0, y: 0 };
+  const lastStored = route.points[route.points.length - 1] ?? firstStored;
+  const start = source ? fixtureWallAnchor(source, existing, lining) : storedWallAnchor(firstStored, lining);
+  const guides = route.points.slice(1, -1).filter((point) => point.wallIndex !== undefined).map((point) => storedWallAnchor(point, lining));
+  const end = target ? fixtureWallAnchor(target, existing, lining) : targetObject ? objectWallAnchor(targetObject, lining) : storedWallAnchor(lastStored, lining);
+  const anchors = [start, ...guides, end];
+  const path = anchors.slice(1).reduce<Point[]>((result, anchor, index) => {
+    const section = wallPathBetween(lining, anchors[index], anchor);
+    return [...result, ...(result.length ? section.slice(1) : section)];
+  }, []);
+  if (targetObject) path.push(objectConnectionPoint(targetObject, lining));
+  return dedupePath(path);
+}
+function effectiveRouteHandles(route: NetworkRoute, fixtures: WallFixture[], objects: PlanObject[], existing: Point[], lining: Point[]) {
+  const lastIndex = route.points.length - 1;
+  return route.points.flatMap((stored, storedIndex) => {
+    const source = storedIndex === 0 ? fixtures.find((fixture) => fixture.id === route.sourceFixtureId) : undefined;
+    const target = storedIndex === lastIndex ? fixtures.find((fixture) => fixture.id === route.targetFixtureId) : undefined;
+    const targetObject = storedIndex === lastIndex ? objects.find((object) => object.id === route.targetObjectId) : undefined;
+    const terminal = Boolean(source || target || targetObject);
+    if (!terminal && storedIndex > 0 && storedIndex < lastIndex && stored.wallIndex === undefined) return [];
+    const point = source ? fixturePosition(source, existing, lining) : target ? fixturePosition(target, existing, lining) : targetObject ? objectConnectionPoint(targetObject, lining) : storedWallAnchor(stored, lining);
+    return [{ point, storedIndex, terminal, wallWaypoint: !terminal }];
   });
 }
-function effectiveRoutePoints(route: NetworkRoute, fixtures: WallFixture[], existing: Point[], lining: Point[]) {
-  const points = copyPoints(route.points).map((point) => {
-    if (point.wallIndex === undefined) return point;
-    const walls = point.wallLayer === "existing" ? existing : lining;
-    const wallIndex = Math.min(point.wallIndex, walls.length - 1);
-    return { ...point, ...pointOnSegment(walls, wallIndex, point.wallOffset ?? 0.5) };
-  });
-  const source = fixtures.find((fixture) => fixture.id === route.sourceFixtureId); const target = fixtures.find((fixture) => fixture.id === route.targetFixtureId);
-  if (source && points.length) points[0] = fixturePosition(source, existing, lining);
-  if (target && points.length) points[points.length - 1] = fixturePosition(target, existing, lining);
-  if (route.id.startsWith("auto-") && points.length === 3 && !route.points.some((point) => point.wallIndex !== undefined)) points[1] = { x: points[0].x, y: points[2].y };
-  return points;
-}
-function routeLength(route: NetworkRoute, fixtures: WallFixture[], existing: Point[], lining: Point[]) {
-  const points = effectiveRoutePoints(route, fixtures, existing, lining);
+function routeLength(route: NetworkRoute, fixtures: WallFixture[], objects: PlanObject[], existing: Point[], lining: Point[]) {
+  const points = effectiveRoutePoints(route, fixtures, objects, existing, lining);
   return points.slice(1).reduce((sum, point, index) => sum + Math.hypot(point.x - points[index].x, point.y - points[index].y), 0) / 100 * 1.15;
 }
 
@@ -291,7 +372,7 @@ export default function Home() {
   const [lining, setLining] = useState<Point[]>(() => createLining(defaultExisting, defaultBuild));
   const [fixtures, setFixtures] = useState<WallFixture[]>(defaultFixtures);
   const [objects, setObjects] = useState<PlanObject[]>(defaultObjects);
-  const [routes, setRoutes] = useState<NetworkRoute[]>(() => automaticRoutes(defaultFixtures, defaultExisting, createLining(defaultExisting, defaultBuild)));
+  const [routes, setRoutes] = useState<NetworkRoute[]>(() => automaticRoutes(defaultFixtures, defaultObjects, defaultExisting, createLining(defaultExisting, defaultBuild)));
   const [products, setProducts] = useState<Product[]>(defaultProducts);
   const [budgetChoices, setBudgetChoices] = useState<Record<string, BudgetChoice>>({});
   const [selectedWall, setSelectedWall] = useState<SelectedWall | null>({ layer: "existing", index: 0 });
@@ -319,7 +400,7 @@ export default function Home() {
   const layerPoints = selectedWall?.layer === "lining" ? lining : existing;
 
   const bounds = useMemo(() => {
-    const all = [...existing, ...lining, ...objects.flatMap((object) => [{ x: object.x, y: object.y }, { x: object.x + object.w, y: object.y + object.h }]), ...routes.flatMap((route) => effectiveRoutePoints(route, fixtures, existing, lining))];
+    const all = [...existing, ...lining, ...objects.flatMap((object) => [{ x: object.x, y: object.y }, { x: object.x + object.w, y: object.y + object.h }]), ...routes.flatMap((route) => effectiveRoutePoints(route, fixtures, objects, existing, lining))];
     const finite = all.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
     const minX = Math.min(0, ...finite.map((point) => point.x)); const minY = Math.min(0, ...finite.map((point) => point.y));
     const maxX = Math.max(600, ...finite.map((point) => point.x)); const maxY = Math.max(550, ...finite.map((point) => point.y)); const padding = 55;
@@ -350,10 +431,10 @@ export default function Home() {
   }, [bounds]);
 
   const routeTotals = useMemo(() => ({
-    electric: routes.filter((route) => route.kind === "electric").reduce((sum, route) => sum + routeLength(route, fixtures, existing, lining), 0),
-    cold: routes.filter((route) => route.kind === "cold").reduce((sum, route) => sum + routeLength(route, fixtures, existing, lining), 0),
-    hot: routes.filter((route) => route.kind === "hot").reduce((sum, route) => sum + routeLength(route, fixtures, existing, lining), 0),
-  }), [routes, fixtures, existing, lining]);
+    electric: routes.filter((route) => route.kind === "electric").reduce((sum, route) => sum + routeLength(route, fixtures, objects, existing, lining), 0),
+    cold: routes.filter((route) => route.kind === "cold").reduce((sum, route) => sum + routeLength(route, fixtures, objects, existing, lining), 0),
+    hot: routes.filter((route) => route.kind === "hot").reduce((sum, route) => sum + routeLength(route, fixtures, objects, existing, lining), 0),
+  }), [routes, fixtures, objects, existing, lining]);
 
   const metrics = useMemo(() => {
     const floor = polygonArea(existing); const existingPerimeter = perimeter(existing); const liningPerimeter = perimeter(lining);
@@ -368,13 +449,13 @@ export default function Home() {
     const railLength = Math.max(0, metrics.liningPerimeter * 2 - doorWidth) * factor;
     const studCount = Math.ceil(metrics.liningPerimeter / (build.studSpacing / 100)) + fixtures.filter((fixture) => fixtureMeta[fixture.kind].opening).length * 2;
     const wallArea = (metrics.wallNet + (build.includeCeiling ? metrics.floor : 0)) * factor;
-    const socketCount = fixtures.filter((fixture) => fixture.kind === "outlet").reduce((sum, fixture) => sum + fixture.quantity, 0);
+    const socketCount = fixtures.filter((fixture) => fixture.kind === "outlet").reduce((sum, fixture) => sum + fixture.quantity, 0) + objects.filter((object) => object.connections?.includes("electric")).length;
     return [
       { key: "per-cold", category: "plomberie", label: "Tube PER eau froide", required: routeTotals.cold, unit: "m", detail: "Tracés + 15 %" },
       { key: "per-hot", category: "plomberie", label: "Tube PER eau chaude", required: routeTotals.hot, unit: "m", detail: "Tracés + 15 %" },
       { key: "cable-15", category: "electricite", label: "Câble 1,5 mm²", required: routeTotals.electric * 0.25, unit: "m", detail: "Part éclairage estimée" },
       { key: "cable-25", category: "electricite", label: "Câble 2,5 mm²", required: routeTotals.electric * 0.75, unit: "m", detail: "Part prises estimée" },
-      { key: "sockets", category: "electricite", label: "Prises complètes", required: socketCount, unit: "u", detail: "Quantité posée sur les murs" },
+      { key: "sockets", category: "electricite", label: "Prises / sorties complètes", required: socketCount, unit: "u", detail: "Points muraux et équipements raccordés" },
       { key: "rails", category: "ossature", label: "Rails métalliques", required: railLength, unit: "m", detail: "Sol + plafond, portes déduites" },
       { key: "studs", category: "ossature", label: "Montants métalliques", required: studCount, unit: "u", detail: `Entraxe ${build.studSpacing} cm + renforts` },
       { key: "insulation", category: "isolation", label: "Isolation", required: wallArea, unit: "m²", detail: "Murs nets avec marge" },
@@ -382,7 +463,7 @@ export default function Home() {
       { key: "tiles", category: "carrelage", label: "Revêtement de sol", required: tileArea, unit: "m²", detail: `Sol + ${build.tileWaste} %` },
       { key: "tile-adhesive", category: "consommables", label: "Colle carrelage", required: tileArea, unit: "m²", detail: "Couverture à prévoir" },
     ];
-  }, [metrics, routeTotals, fixtures, build]);
+  }, [metrics, routeTotals, fixtures, objects, build]);
 
   const resolvedBudget = useMemo(() => materials.map((line) => {
     const compatibles = products.filter((product) => product.category === line.category && product.coverageUnit === line.unit);
@@ -534,8 +615,8 @@ export default function Home() {
     }));
     if (drag.type === "route-point") setRoutes((current) => current.map((route) => route.id === drag.routeId ? { ...route, points: route.points.map((point, index) => {
       if (index !== drag.pointIndex) return point;
-      if (point.wallIndex !== undefined) { const nearest = nearestWallProjection(pointer, lining); return nearest ? { x: nearest.point.x, y: nearest.point.y, wallIndex: nearest.wallIndex, wallOffset: nearest.wallOffset, wallLayer: "lining" } : point; }
-      return { x: round(drag.origin.x + pointer.x - drag.start.x), y: round(drag.origin.y + pointer.y - drag.start.y) };
+      const nearest = nearestWallProjection(pointer, lining);
+      return nearest ? { x: nearest.point.x, y: nearest.point.y, wallIndex: nearest.wallIndex, wallOffset: nearest.wallOffset, wallLayer: "lining" } : point;
     }) } : route));
   }
   function endDrag() {
@@ -562,29 +643,31 @@ export default function Home() {
   }
   function deleteWallPoint() { if (!selectedWall || layerPoints.length <= 3) return; const deleteIndex = (selectedWall.index + 1) % layerPoints.length; setPoints(selectedWall.layer, (points) => points.filter((_, index) => index !== deleteIndex)); setSelectedWall({ ...selectedWall, index: Math.max(0, selectedWall.index - 1) }); }
   function alignWall(axis: "horizontal" | "vertical") { if (!selectedWall) return; setPoints(selectedWall.layer, (points) => { const next = copyPoints(points); const { a, b } = segment(points, selectedWall.index); next[(selectedWall.index + 1) % points.length] = axis === "horizontal" ? { x: b.x, y: a.y } : { x: a.x, y: b.y }; return next; }); }
-  function regenerateLining() { const next = createLining(existing, build); setLining(next); setFixtures((current) => current.map((fixture) => fixture.layer === "lining" ? { ...fixture, wallIndex: Math.min(fixture.wallIndex, next.length - 1) } : fixture)); setRoutes((current) => automaticRoutes(fixtures, existing, next).concat(current.filter((route) => !route.targetFixtureId))); setNotice(build.autoSquareLining ? `${correctedWallCount} mur${correctedWallCount > 1 ? "s" : ""} redressé${correctedWallCount > 1 ? "s" : ""} pour les rails et le BA13` : "Doublage BA13 recalculé en suivant le bâti"); }
+  function regenerateLining() { const next = createLining(existing, build); const adjustedFixtures = fixtures.map((fixture) => fixture.layer === "lining" ? { ...fixture, wallIndex: Math.min(fixture.wallIndex, next.length - 1) } : fixture); setLining(next); setFixtures(adjustedFixtures); setRoutes((current) => mergeAutomaticRoutes(current, automaticRoutes(adjustedFixtures, objects, existing, next))); setNotice(build.autoSquareLining ? `${correctedWallCount} mur${correctedWallCount > 1 ? "s" : ""} redressé${correctedWallCount > 1 ? "s" : ""} pour les rails et le BA13` : "Doublage BA13 recalculé en suivant le bâti"); }
 
   function addFixture(kind: FixtureKind) {
     const layer: Layer = kind === "door" || kind === "window" ? "existing" : "lining"; const points = layer === "existing" ? existing : lining; const wallIndex = selectedWall?.layer === layer ? selectedWall.index : 0;
     const fixture: WallFixture = { id: `${kind}-${uid()}`, kind, name: fixtureMeta[kind].label, layer, wallIndex: Math.min(wallIndex, points.length - 1), offset: 0.5, width: kind === "door" ? 90 : kind === "window" ? 120 : 8, height: kind === "door" ? 215 : kind === "window" ? 110 : 8, mountHeight: kind === "window" ? 90 : kind === "outlet" ? 30 : 0, quantity: 1, unitPrice: 0, showPrice: true };
-    const all = [...fixtures, fixture]; setFixtures(all); const network = fixtureNetwork(kind); if (network) setRoutes((current) => [...current, ...automaticRoutes(all, existing, lining).filter((route) => route.targetFixtureId === fixture.id)]); setSelectedFixtureId(fixture.id); clearSelection("fixture"); setNotice(`${fixture.name} fixé au mur`);
+    const all = [...fixtures, fixture]; setFixtures(all); setRoutes((current) => mergeAutomaticRoutes(current, automaticRoutes(all, objects, existing, lining))); setSelectedFixtureId(fixture.id); clearSelection("fixture"); setNotice(`${fixture.name} fixé au mur`);
   }
   function updateFixture(changes: Partial<WallFixture>) { if (selectedFixtureId) setFixtures((current) => current.map((fixture) => fixture.id === selectedFixtureId ? { ...fixture, ...changes } : fixture)); }
-  function deleteFixture() { if (!selectedFixtureId) return; setFixtures((current) => current.filter((fixture) => fixture.id !== selectedFixtureId)); setRoutes((current) => current.filter((route) => route.sourceFixtureId !== selectedFixtureId && route.targetFixtureId !== selectedFixtureId)); setSelectedFixtureId(null); }
+  function deleteFixture() { if (!selectedFixtureId) return; const nextFixtures = fixtures.filter((fixture) => fixture.id !== selectedFixtureId); setFixtures(nextFixtures); setRoutes((current) => mergeAutomaticRoutes(current.filter((route) => route.sourceFixtureId !== selectedFixtureId && route.targetFixtureId !== selectedFixtureId), automaticRoutes(nextFixtures, objects, existing, lining))); setSelectedFixtureId(null); }
 
-  function addObject(kind: ObjectKind) { const meta = objectMeta[kind]; const object = { id: `${kind}-${uid()}`, kind, name: meta.label, x: 170, y: 190, w: meta.w, h: meta.h, unitPrice: 0, showPrice: true }; setObjects((current) => [...current, object]); setSelectedObjectId(object.id); clearSelection("object"); }
-  function updateObject(changes: Partial<PlanObject>) { if (selectedObjectId) setObjects((current) => current.map((object) => object.id === selectedObjectId ? { ...object, ...changes } : object)); }
+  function addObject(kind: ObjectKind) { const meta = objectMeta[kind]; const object: PlanObject = { id: `${kind}-${uid()}`, kind, name: meta.label, x: 170, y: 190, w: meta.w, h: meta.h, connections: meta.connections ? [...meta.connections] : [], unitPrice: 0, showPrice: true }; const nextObjects = [...objects, object]; setObjects(nextObjects); setRoutes((current) => mergeAutomaticRoutes(current, automaticRoutes(fixtures, nextObjects, existing, lining))); setSelectedObjectId(object.id); clearSelection("object"); }
+  function updateObject(changes: Partial<PlanObject>) { if (!selectedObjectId) return; setObjects((current) => current.map((object) => object.id === selectedObjectId ? { ...object, ...changes } : object)); if (changes.name) setRoutes((current) => current.map((route) => route.targetObjectId === selectedObjectId ? { ...route, name: `${networkName(route.kind)} · ${changes.name}` } : route)); }
+  function setObjectConnection(objectId: string, kind: NetworkKind, enabled: boolean) {
+    const nextObjects = objects.map((object) => object.id === objectId ? { ...object, connections: enabled ? Array.from(new Set([...(object.connections ?? []), kind])) : (object.connections ?? []).filter((entry) => entry !== kind) } : object);
+    setObjects(nextObjects); setRoutes((current) => mergeAutomaticRoutes(current, automaticRoutes(fixtures, nextObjects, existing, lining))); setNotice(enabled ? `${networkName(kind)} raccordée à l’équipement` : `${networkName(kind)} retirée de l’équipement`);
+  }
+  function deleteObject(objectId: string) { const nextObjects = objects.filter((object) => object.id !== objectId); setObjects(nextObjects); setRoutes((current) => mergeAutomaticRoutes(current.filter((route) => route.targetObjectId !== objectId), automaticRoutes(fixtures, nextObjects, existing, lining))); setSelectedObjectId(null); }
 
-  function addFreeRoute(kind: NetworkKind) { const source = fixtures.find((fixture) => fixtureSource(fixture.kind) === kind); const start = source ? fixturePosition(source, existing, lining) : { x: 40, y: 40 }; const end = { x: 300, y: 260 }; const route = { id: `route-${uid()}`, kind, name: `${networkName(kind)} libre`, sourceFixtureId: source?.id, points: [start, { x: start.x, y: end.y }, end] }; setRoutes((current) => [...current, route]); setSelectedRouteId(route.id); clearSelection("route"); }
-  function addRoutePoint() { if (!selectedRoute) return; const points = effectiveRoutePoints(selectedRoute, fixtures, existing, lining); const index = Math.max(1, points.length - 1); const a = points[index - 1]; const b = points[index]; setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, points: [...route.points.slice(0, index), { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, ...route.points.slice(index)] } : route)); }
+  function addFreeRoute(kind: NetworkKind) { const source = fixtures.find((fixture) => fixtureSource(fixture.kind) === kind); const start = source ? fixtureWallAnchor(source, existing, lining) : storedWallAnchor({ x: 40, y: 40 }, lining); const end = storedWallAnchor({ x: 300, y: 260 }, lining); const route = { id: `route-${uid()}`, kind, name: `${networkName(kind)} vers une autre pièce`, sourceFixtureId: source?.id, points: [start, end] }; setRoutes((current) => [...current, route]); setSelectedRouteId(route.id); clearSelection("route"); setNotice("La sortie libre reste fixée au doublage BA13"); }
   function addWallWaypoint(event: ReactPointerEvent<SVGLineElement>, wallIndex: number) {
     if (!selectedRoute || !routeWallWaypointMode) return false;
     const pointer = pointFromEvent(event); if (!pointer) return false; const projected = projectOnSegment(pointer, lining, wallIndex);
     const waypoint: RoutePoint = { x: projected.point.x, y: projected.point.y, wallIndex, wallOffset: projected.wallOffset, wallLayer: "lining" };
     setRoutes((current) => current.map((route) => {
       if (route.id !== selectedRoute.id) return route;
-      const alreadyGuided = route.points.some((point) => point.wallIndex !== undefined);
-      if (route.id.startsWith("auto-") && !alreadyGuided) return { ...route, points: [route.points[0], waypoint, route.points[route.points.length - 1]] };
       const insertAt = Math.max(1, route.points.length - 1);
       return { ...route, points: [...route.points.slice(0, insertAt), waypoint, ...route.points.slice(insertAt)] };
     }));
@@ -595,9 +678,8 @@ export default function Home() {
     const lastIndex = selectedRoute.points.reduce((found, point, index) => point.wallIndex !== undefined && index > 0 && index < selectedRoute.points.length - 1 ? index : found, -1);
     if (lastIndex < 0) { setNotice("Ce tracé n’a pas encore de passage mural"); return; }
     setRoutes((current) => current.map((route) => {
-      if (route.id !== selectedRoute.id) return route; const points = route.points.filter((_, index) => index !== lastIndex);
-      if (route.id.startsWith("auto-") && points.length === 2) return { ...route, points: [points[0], { x: points[0].x, y: points[1].y }, points[1]] };
-      return { ...route, points };
+      if (route.id !== selectedRoute.id) return route;
+      return { ...route, points: route.points.filter((_, index) => index !== lastIndex) };
     }));
     setNotice("Dernier point de passage retiré");
   }
@@ -605,18 +687,18 @@ export default function Home() {
   function resetPlan() {
     if (!window.confirm("Créer un nouveau plan ? Le brouillon actuel sera remplacé, mais tes configurations sauvegardées et ta bibliothèque de produits resteront disponibles.")) return;
     const nextExisting = copyPoints(defaultExisting); const nextBuild = { ...defaultBuild }; const nextLining = createLining(nextExisting, nextBuild); const nextFixtures = copyFixtures(defaultFixtures);
-    setProjectName("Nouveau projet"); setExisting(nextExisting); setBuild(nextBuild); setLining(nextLining); setFixtures(nextFixtures); setObjects(copyObjects(defaultObjects)); setRoutes(automaticRoutes(nextFixtures, nextExisting, nextLining)); setBudgetChoices({});
+    const nextObjects = copyObjects(defaultObjects); setProjectName("Nouveau projet"); setExisting(nextExisting); setBuild(nextBuild); setLining(nextLining); setFixtures(nextFixtures); setObjects(nextObjects); setRoutes(automaticRoutes(nextFixtures, nextObjects, nextExisting, nextLining)); setBudgetChoices({});
     setElementSnap(true); setShowPrices(false); setViewport(null); setMode("plan"); setSelectedWall({ layer: "existing", index: 0 }); setSelectedFixtureId(null); setSelectedObjectId(null); setSelectedRouteId(null); setRouteWallWaypointMode(false); setNotice("Nouveau plan créé — les sauvegardes et produits sont conservés");
   }
   function saveProject() { const name = projectName.trim() || "Projet sans nom"; const saved: SavedProject = { id: uid(), name, updatedAt: new Date().toISOString(), existing: copyPoints(existing), lining: copyPoints(lining), fixtures: copyFixtures(fixtures), objects: copyObjects(objects), routes: copyRoutes(routes), build: { ...build }, budgetChoices: { ...budgetChoices }, elementSnap, showPrices }; setSavedProjects((current) => [saved, ...current]); setNotice(`« ${name} » sauvegardé`); }
-  function loadProject(project: SavedProject) { setProjectName(project.name); setExisting(copyPoints(project.existing)); setLining(copyPoints(project.lining)); setFixtures(copyFixtures(project.fixtures)); setObjects(copyObjects(project.objects)); setRoutes(copyRoutes(project.routes)); setBuild({ ...defaultBuild, ...project.build }); setBudgetChoices({ ...project.budgetChoices }); setElementSnap(project.elementSnap ?? true); setShowPrices(project.showPrices ?? false); setViewport(null); setRouteWallWaypointMode(false); setNotice(`« ${project.name} » chargé`); }
+  function loadProject(project: SavedProject) { const nextExisting = copyPoints(project.existing); const nextLining = copyPoints(project.lining); const nextFixtures = copyFixtures(project.fixtures); const nextObjects = copyObjects(project.objects); setProjectName(project.name); setExisting(nextExisting); setLining(nextLining); setFixtures(nextFixtures); setObjects(nextObjects); setRoutes(mergeAutomaticRoutes(copyRoutes(project.routes), automaticRoutes(nextFixtures, nextObjects, nextExisting, nextLining))); setBuild({ ...defaultBuild, ...project.build }); setBudgetChoices({ ...project.budgetChoices }); setElementSnap(project.elementSnap ?? true); setShowPrices(project.showPrices ?? false); setViewport(null); setRouteWallWaypointMode(false); setNotice(`« ${project.name} » chargé`); }
 
   function addProduct() { if (!newProduct.name.trim()) return; setProducts((current) => [{ ...newProduct, id: uid() }, ...current]); setNewProduct((current) => ({ ...current, name: "", reference: "", price: 0 })); setNotice("Produit ajouté à la bibliothèque"); }
   function updateProduct(id: string, changes: Partial<Product>) { setProducts((current) => current.map((product) => product.id === id ? { ...product, ...changes } : product)); }
   function importProducts(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => { try { const text = String(reader.result ?? ""); const lines = text.split(/\r?\n/).filter(Boolean); const delimiter = lines[0]?.includes(";") ? ";" : ","; const imported = lines.slice(1).map((line) => { const [name, reference, category, store, price, coverage, unit, packLabel, url] = line.split(delimiter).map((value) => value.trim()); if (!name) return null; return { id: uid(), name, reference: reference ?? "", category: (category as ProductCategory) || "consommables", store: store ?? "", price: Number(String(price).replace(",", ".")) || 0, coverage: Number(String(coverage).replace(",", ".")) || 1, coverageUnit: unit || "u", packLabel: packLabel || "unité", url: url ?? "", checkedAt: new Date().toISOString().slice(0, 10) } as Product; }).filter(Boolean) as Product[]; setProducts((current) => [...imported, ...current]); setNotice(`${imported.length} produits importés`); } catch { setNotice("Import impossible : vérifie le format CSV"); } }; reader.readAsText(file); event.target.value = ""; }
 
   const wallPath = (points: Point[]) => points.map((point, index) => `${index ? "L" : "M"}${point.x},${point.y}`).join(" ") + " Z";
-  const routePath = (route: NetworkRoute) => effectiveRoutePoints(route, fixtures, existing, lining).map((point, index) => `${index ? "L" : "M"}${point.x},${point.y}`).join(" ");
+  const routePath = (route: NetworkRoute) => effectiveRoutePoints(route, fixtures, objects, existing, lining).map((point, index) => `${index ? "L" : "M"}${point.x},${point.y}`).join(" ");
   const euros = (value: number) => new Intl.NumberFormat("fr-FR", { style: "currency", currency: "EUR" }).format(value);
 
   return (
@@ -660,10 +742,10 @@ export default function Home() {
                 return <g key={fixture.id} className={`wall-fixture ${opening ? "opening-fixture" : "technical-fixture"} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={fixture.name} onPointerDown={(event) => beginFixtureDrag(event, fixture)}>{opening ? <><line x1={position.x - tx * half} y1={position.y - ty * half} x2={position.x + tx * half} y2={position.y + ty * half} stroke={fixtureMeta[fixture.kind].color} /><text x={position.x} y={position.y - 11} textAnchor="middle">{fixture.name}</text></> : <><circle cx={position.x} cy={position.y} r="9" fill={fixtureMeta[fixture.kind].color} /><text x={position.x} y={position.y} textAnchor="middle" dominantBaseline="middle">{fixtureMeta[fixture.kind].short}</text>{fixture.quantity > 1 && <text className="fixture-quantity" x={position.x + 9} y={position.y - 9}>{fixture.quantity}</text>}</>}{showPrices && fixture.showPrice !== false && (fixture.unitPrice ?? 0) > 0 && <g className="price-tag" transform={`translate(${position.x},${position.y + 20})`}><rect x="-27" y="-8" width="54" height="16" rx="7" /><text textAnchor="middle" dominantBaseline="middle">{euros((fixture.unitPrice ?? 0) * fixture.quantity)}</text></g>}</g>;
               })}
 
-              {mode !== "plan" && objects.map((object) => { const selected = selectedObjectId === object.id; return <g key={object.id} className={`plan-object ${mode === "networks" ? "ghost" : ""} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={object.name} onPointerDown={(event) => beginObjectDrag(event, object, "object")}><rect x={object.x} y={object.y} width={object.w} height={object.h} rx="3" fill={objectMeta[object.kind].color} /><text x={object.x + object.w / 2} y={object.y + object.h / 2} textAnchor="middle" dominantBaseline="middle">{object.name}</text>{mode === "layout" && <text className="object-size" x={object.x + object.w / 2} y={object.y + object.h / 2 + 14} textAnchor="middle">{Math.round(object.w)} × {Math.round(object.h)}</text>}{showPrices && object.showPrice !== false && (object.unitPrice ?? 0) > 0 && <g className="price-tag" transform={`translate(${object.x + object.w / 2},${object.y + object.h + 12})`}><rect x="-27" y="-8" width="54" height="16" rx="7" /><text textAnchor="middle" dominantBaseline="middle">{euros(object.unitPrice ?? 0)}</text></g>}{selected && mode === "layout" && <rect className="resize-handle" x={object.x + object.w - 7} y={object.y + object.h - 7} width="14" height="14" rx="3" onPointerDown={(event) => beginObjectDrag(event, object, "resize-object")} />}</g>; })}
+              {mode !== "plan" && objects.map((object) => { const selected = selectedObjectId === object.id; const connected = object.connections?.includes(networkFilter) ?? false; const port = objectConnectionPoint(object, lining); return <g key={object.id} className={`plan-object ${mode === "networks" && !connected ? "ghost" : ""} ${mode === "networks" && connected ? "network-connected" : ""} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={object.name} onPointerDown={(event) => { if (mode !== "networks") { beginObjectDrag(event, object, "object"); return; } event.preventDefault(); event.stopPropagation(); setSelectedObjectId(object.id); clearSelection("object"); }}><rect x={object.x} y={object.y} width={object.w} height={object.h} rx="3" fill={objectMeta[object.kind].color} /><text x={object.x + object.w / 2} y={object.y + object.h / 2} textAnchor="middle" dominantBaseline="middle">{object.name}</text>{mode === "layout" && <text className="object-size" x={object.x + object.w / 2} y={object.y + object.h / 2 + 14} textAnchor="middle">{Math.round(object.w)} × {Math.round(object.h)}</text>}{mode === "networks" && connected && <g className={`object-network-port port-${networkFilter}`}><circle cx={port.x} cy={port.y} r="8" /><text x={port.x} y={port.y} textAnchor="middle" dominantBaseline="middle">{networkFilter === "electric" ? "E" : networkFilter === "cold" ? "F" : "C"}</text></g>}{showPrices && object.showPrice !== false && (object.unitPrice ?? 0) > 0 && <g className="price-tag" transform={`translate(${object.x + object.w / 2},${object.y + object.h + 12})`}><rect x="-27" y="-8" width="54" height="16" rx="7" /><text textAnchor="middle" dominantBaseline="middle">{euros(object.unitPrice ?? 0)}</text></g>}{selected && mode === "layout" && <rect className="resize-handle" x={object.x + object.w - 7} y={object.y + object.h - 7} width="14" height="14" rx="3" onPointerDown={(event) => beginObjectDrag(event, object, "resize-object")} />}</g>; })}
 
               {mode === "networks" && routes.filter((route) => route.kind === networkFilter).map((route) => <g key={route.id} className={`network-route route-${route.kind} ${selectedRouteId === route.id ? "selected" : ""}`}><path className="route-hit" d={routePath(route)} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedRouteId(route.id); setRouteWallWaypointMode(false); clearSelection("route"); }} /><path d={routePath(route)} pointerEvents="none" /></g>)}
-              {mode === "networks" && selectedRoute && selectedRoute.kind === networkFilter && <g className={`route-handles handles-${selectedRoute.kind}`}>{effectiveRoutePoints(selectedRoute, fixtures, existing, lining).map((point, index) => { const terminal = Boolean(index === 0 && selectedRoute.sourceFixtureId || index === selectedRoute.points.length - 1 && selectedRoute.targetFixtureId); const wallWaypoint = selectedRoute.points[index]?.wallIndex !== undefined; return <circle key={index} cx={point.x} cy={point.y} r={terminal ? 4 : wallWaypoint ? 8 : 7} className={terminal ? "anchored" : wallWaypoint ? "wall-waypoint" : "movable"} onPointerDown={(event) => { if (terminal) return; const start = pointFromEvent(event); if (!start) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "route-point", routeId: selectedRoute.id, pointIndex: index, start, origin: point }; }} />; })}</g>}
+              {mode === "networks" && selectedRoute && selectedRoute.kind === networkFilter && <g className={`route-handles handles-${selectedRoute.kind}`}>{effectiveRouteHandles(selectedRoute, fixtures, objects, existing, lining).map(({ point, storedIndex, terminal, wallWaypoint }) => <circle key={storedIndex} cx={point.x} cy={point.y} r={terminal ? 4 : wallWaypoint ? 8 : 7} className={terminal ? "anchored" : wallWaypoint ? "wall-waypoint" : "movable"} onPointerDown={(event) => { if (terminal) return; const start = pointFromEvent(event); if (!start) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "route-point", routeId: selectedRoute.id, pointIndex: storedIndex, start, origin: point }; }} />)}</g>}
             </svg>
           </div>
           <div className="canvas-footer"><span><b>{existing.length}</b> angles du bâti</span><span><b>{metrics.existingPerimeter.toFixed(1)} m</b> de murs existants</span><span><b>{metrics.liningPerimeter.toFixed(1)} m</b> de doublage</span><span><b>{metrics.openingArea.toFixed(1)} m²</b> d’ouvertures déduites</span></div>
@@ -681,16 +763,17 @@ export default function Home() {
             </div>
           )}
 
-          {mode === "layout" && <div className="inspector-content"><div className="panel-title"><span>02 · Aménagement</span><h2>Volumes dans la pièce</h2><p>Les murs techniques restent discrets pour laisser la priorité à l’agencement.</p></div><div className="object-catalog">{(Object.keys(objectMeta) as ObjectKind[]).map((kind) => <button type="button" key={kind} onClick={() => addObject(kind)}><i style={{ background: objectMeta[kind].color }} /><span>{objectMeta[kind].label}</span><b>＋</b></button>)}</div>{selectedObject ? <div className="selection-card"><span className="selection-label">Objet sélectionné</span><input className="name-field" value={selectedObject.name} onChange={(event) => updateObject({ name: event.target.value })} /><div className="field-grid"><NumberInput label="Position X" value={selectedObject.x} onChange={(x) => updateObject({ x })} /><NumberInput label="Position Y" value={selectedObject.y} onChange={(y) => updateObject({ y })} /><NumberInput label="Largeur" value={selectedObject.w} min={20} onChange={(w) => updateObject({ w })} /><NumberInput label="Profondeur" value={selectedObject.h} min={20} onChange={(h) => updateObject({ h })} /><NumberInput label="Prix de l’élément" value={selectedObject.unitPrice ?? 0} unit="€" step={0.1} onChange={(unitPrice) => updateObject({ unitPrice })} /></div><label className="display-price-toggle"><input type="checkbox" checked={selectedObject.showPrice !== false} onChange={(event) => updateObject({ showPrice: event.target.checked })} /> Afficher ce prix sur le plan</label><div className="tool-grid"><button type="button" onClick={() => updateObject({ w: selectedObject.h, h: selectedObject.w })}>Pivoter 90°</button><button type="button" className="danger" onClick={() => { setObjects((current) => current.filter((object) => object.id !== selectedObject.id)); setSelectedObjectId(null); }}>Supprimer</button></div></div> : <div className="empty-selection compact"><span>↖</span><strong>Choisis ou sélectionne un volume</strong></div>}</div>}
+          {mode === "layout" && <div className="inspector-content"><div className="panel-title"><span>02 · Aménagement</span><h2>Volumes dans la pièce</h2><p>Ajoute les meubles et équipements, puis indique leurs besoins techniques.</p></div><div className="object-catalog">{(Object.keys(objectMeta) as ObjectKind[]).map((kind) => <button type="button" key={kind} onClick={() => addObject(kind)}><i style={{ background: objectMeta[kind].color }} /><span>{objectMeta[kind].label}</span><b>＋</b></button>)}</div>{selectedObject ? <div className="selection-card"><span className="selection-label">Objet sélectionné</span><input className="name-field" value={selectedObject.name} onChange={(event) => updateObject({ name: event.target.value })} /><div className="field-grid"><NumberInput label="Position X" value={selectedObject.x} onChange={(x) => updateObject({ x })} /><NumberInput label="Position Y" value={selectedObject.y} onChange={(y) => updateObject({ y })} /><NumberInput label="Largeur" value={selectedObject.w} min={20} onChange={(w) => updateObject({ w })} /><NumberInput label="Profondeur" value={selectedObject.h} min={20} onChange={(h) => updateObject({ h })} /><NumberInput label="Prix de l’élément" value={selectedObject.unitPrice ?? 0} unit="€" step={0.1} onChange={(unitPrice) => updateObject({ unitPrice })} /></div><ObjectConnections object={selectedObject} onToggle={(kind, enabled) => setObjectConnection(selectedObject.id, kind, enabled)} /><label className="display-price-toggle"><input type="checkbox" checked={selectedObject.showPrice !== false} onChange={(event) => updateObject({ showPrice: event.target.checked })} /> Afficher ce prix sur le plan</label><div className="tool-grid"><button type="button" onClick={() => updateObject({ w: selectedObject.h, h: selectedObject.w })}>Pivoter 90°</button><button type="button" className="danger" onClick={() => deleteObject(selectedObject.id)}>Supprimer</button></div></div> : <div className="empty-selection compact"><span>↖</span><strong>Choisis ou sélectionne un volume</strong></div>}</div>}
 
           {mode === "networks" && (
             <div className="inspector-content">
-              <div className="panel-title"><span>03 · Technique</span><h2>Routage guidé</h2><p>Déplace chaque équipement sur n’importe quel mur BA13, puis impose le trajet avec des points de passage.</p></div>
+              <div className="panel-title"><span>03 · Technique</span><h2>Routage le long du BA13</h2><p>Chaque câble et tuyau suit automatiquement les murs. Un nœud sert uniquement à imposer un mur de passage.</p></div>
               <div className="network-switch">{(["electric", "cold", "hot"] as NetworkKind[]).map((kind) => <button type="button" key={kind} className={networkFilter === kind ? "active" : ""} onClick={() => { setNetworkFilter(kind); setSelectedRouteId(null); setRouteWallWaypointMode(false); }}>{networkName(kind)}<strong>{routeTotals[kind].toFixed(1)} m</strong></button>)}</div>
               <div className="network-actions">{networkFilter === "electric" ? <><button type="button" onClick={() => addFixture("source-electric")}>＋ Tableau</button><button type="button" onClick={() => addFixture("outlet")}>＋ Prise</button><button type="button" onClick={() => addFixture("switch")}>＋ Interrupteur</button><button type="button" onClick={() => addFixture("light")}>＋ Éclairage</button></> : networkFilter === "cold" ? <><button type="button" onClick={() => addFixture("source-cold")}>＋ Arrivée EF</button><button type="button" onClick={() => addFixture("water-cold")}>＋ Sortie EF</button></> : <><button type="button" onClick={() => addFixture("source-hot")}>＋ Départ EC</button><button type="button" onClick={() => addFixture("water-hot")}>＋ Sortie EC</button></>}<button type="button" className="wide" onClick={() => addFreeRoute(networkFilter)}>＋ Tracé libre vers une autre pièce</button></div>
               {selectedFixture && !fixtureMeta[selectedFixture.kind].opening && <><div className="fixture-move-hint">Glisse ce point vers le mur BA13 de ton choix : il changera automatiquement de paroi.</div><FixtureInspector fixture={selectedFixture} onChange={updateFixture} onDelete={deleteFixture} /></>}
-              {selectedRoute && <div className="selection-card route-card"><span className="selection-label">Tracé sélectionné</span><input className="name-field" value={selectedRoute.name} onChange={(event) => { const name = event.currentTarget.value; setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, name } : route)); }} /><p><strong>{routeLength(selectedRoute, fixtures, existing, lining).toFixed(2)} m</strong> avec marge de 15 % · {selectedRoute.points.filter((point) => point.wallIndex !== undefined).length} passage(s) mural(aux)</p><div className="tool-grid route-tools"><button type="button" onClick={addRoutePoint}>＋ Coude libre</button><button type="button" className={routeWallWaypointMode ? "active" : ""} onClick={() => { setRouteWallWaypointMode((current) => !current); setNotice(routeWallWaypointMode ? "Ajout de passage annulé" : "Clique maintenant sur le mur BA13 à emprunter"); }}>＋ Passage mural</button><button type="button" onClick={removeLastWallWaypoint}>Retirer le dernier passage</button><button type="button" className="danger" onClick={() => { setRoutes((current) => current.filter((route) => route.id !== selectedRoute.id)); setSelectedRouteId(null); setRouteWallWaypointMode(false); }}>Supprimer le tracé</button></div>{routeWallWaypointMode && <div className="route-map-hint"><span>1</span><div><strong>Choisis le prochain passage</strong><small>Clique directement sur le mur BA13 voulu dans le plan.</small></div></div>}</div>}
-              <div className="route-list">{routes.filter((route) => route.kind === networkFilter).map((route) => <button type="button" key={route.id} className={selectedRouteId === route.id ? "active" : ""} onClick={() => { setSelectedRouteId(route.id); setRouteWallWaypointMode(false); clearSelection("route"); }}><span>{route.name}</span><strong>{routeLength(route, fixtures, existing, lining).toFixed(1)} m</strong></button>)}</div>
+              {selectedObject && <div className="selection-card equipment-network-card"><span className="selection-label">Équipement sélectionné</span><strong>{selectedObject.name}</strong><p>Active les réseaux nécessaires. Le trajet rejoint le BA13 au point le plus proche, puis suit les murs jusqu’à la source.</p><ObjectConnections object={selectedObject} onToggle={(kind, enabled) => setObjectConnection(selectedObject.id, kind, enabled)} /></div>}
+              {selectedRoute && <div className="selection-card route-card"><span className="selection-label">Tracé sélectionné</span><input className="name-field" value={selectedRoute.name} onChange={(event) => { const name = event.currentTarget.value; setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, name } : route)); }} /><p><strong>{routeLength(selectedRoute, fixtures, objects, existing, lining).toFixed(2)} m</strong> avec marge de 15 % · {selectedRoute.points.slice(1, -1).filter((point) => point.wallIndex !== undefined).length} mur(s) imposé(s)</p><div className="tool-grid route-tools"><button type="button" className={routeWallWaypointMode ? "active" : ""} onClick={() => { setRouteWallWaypointMode((current) => !current); setNotice(routeWallWaypointMode ? "Ajout de nœud annulé" : "Clique maintenant sur le mur BA13 à emprunter"); }}>＋ Imposer un mur</button><button type="button" onClick={removeLastWallWaypoint}>Retirer le dernier nœud</button><button type="button" className="danger" onClick={() => { setRoutes((current) => current.filter((route) => route.id !== selectedRoute.id)); setSelectedRouteId(null); setRouteWallWaypointMode(false); }}>Supprimer le tracé</button></div>{routeWallWaypointMode && <div className="route-map-hint"><span>1</span><div><strong>Choisis le mur à emprunter</strong><small>Le nœud restera aimanté au BA13 et pourra ensuite glisser sur les murs.</small></div></div>}</div>}
+              <div className="route-list">{routes.filter((route) => route.kind === networkFilter).map((route) => <button type="button" key={route.id} className={selectedRouteId === route.id ? "active" : ""} onClick={() => { setSelectedRouteId(route.id); setRouteWallWaypointMode(false); clearSelection("route"); }}><span>{route.name}</span><strong>{routeLength(route, fixtures, objects, existing, lining).toFixed(1)} m</strong></button>)}</div>
             </div>
           )}
 
@@ -739,6 +822,10 @@ export default function Home() {
       </section>
     </main>
   );
+}
+
+function ObjectConnections({ object, onToggle }: { object: PlanObject; onToggle: (kind: NetworkKind, enabled: boolean) => void }) {
+  return <div className="connection-editor"><span>Raccordements de l’équipement</span><div>{(["electric", "cold", "hot"] as NetworkKind[]).map((kind) => { const checked = object.connections?.includes(kind) ?? false; return <label key={kind} className={`connection-chip connection-${kind} ${checked ? "active" : ""}`}><input type="checkbox" checked={checked} onChange={(event) => onToggle(kind, event.currentTarget.checked)} /><i />{networkName(kind)}</label>; })}</div><small>Les longueurs et le budget se recalculent automatiquement.</small></div>;
 }
 
 function FixtureInspector({ fixture, onChange, onDelete }: { fixture: WallFixture; onChange: (changes: Partial<WallFixture>) => void; onDelete: () => void }) {
