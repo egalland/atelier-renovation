@@ -13,6 +13,7 @@ type Mode = "plan" | "layout" | "networks" | "budget" | "products";
 type Layer = "existing" | "lining";
 type NetworkKind = "electric" | "cold" | "hot";
 type Point = { x: number; y: number };
+type RoutePoint = Point & { wallIndex?: number; wallOffset?: number; wallLayer?: Layer };
 type SelectedWall = { layer: Layer; index: number };
 
 type FixtureKind = "door" | "window" | "outlet" | "switch" | "light" | "water-cold" | "water-hot" | "source-electric" | "source-cold" | "source-hot";
@@ -33,7 +34,7 @@ type WallFixture = {
 
 type ObjectKind = "cabinet" | "tall" | "worktop" | "appliance" | "sanitary" | "table" | "radiator" | "custom";
 type PlanObject = { id: string; kind: ObjectKind; name: string; x: number; y: number; w: number; h: number; unitPrice?: number; showPrice?: boolean };
-type NetworkRoute = { id: string; kind: NetworkKind; name: string; points: Point[]; sourceFixtureId?: string; targetFixtureId?: string };
+type NetworkRoute = { id: string; kind: NetworkKind; name: string; points: RoutePoint[]; sourceFixtureId?: string; targetFixtureId?: string };
 
 type ProductCategory = "plomberie" | "electricite" | "ossature" | "isolation" | "plaques" | "carrelage" | "consommables";
 type Product = {
@@ -85,7 +86,7 @@ const formatDate = (value: string) => {
   const [year, month, day] = value.split("-");
   return year && month && day ? `${day}/${month}/${year}` : value;
 };
-const copyPoints = (points: Point[]) => points.map((point) => ({ ...point }));
+const copyPoints = <T extends Point>(points: T[]): T[] => points.map((point) => ({ ...point }));
 const copyFixtures = (fixtures: WallFixture[]) => fixtures.map((fixture) => ({ ...fixture }));
 const copyObjects = (objects: PlanObject[]) => objects.map((object) => ({ ...object }));
 const copyRoutes = (routes: NetworkRoute[]) => routes.map((route) => ({ ...route, points: copyPoints(route.points) }));
@@ -177,6 +178,15 @@ function segment(points: Point[], index: number) { return { a: points[index % po
 function segmentLength(points: Point[], index: number) { const { a, b } = segment(points, index); return Math.hypot(b.x - a.x, b.y - a.y); }
 function segmentAngle(points: Point[], index: number) { const { a, b } = segment(points, index); return Math.atan2(b.y - a.y, b.x - a.x) * 180 / Math.PI; }
 function pointOnSegment(points: Point[], index: number, offset: number) { const { a, b } = segment(points, index); return { x: a.x + (b.x - a.x) * offset, y: a.y + (b.y - a.y) * offset }; }
+function projectOnSegment(point: Point, points: Point[], index: number) {
+  const wall = segment(points, index); const dx = wall.b.x - wall.a.x; const dy = wall.b.y - wall.a.y; const squared = dx * dx + dy * dy || 1;
+  const offset = clamp(((point.x - wall.a.x) * dx + (point.y - wall.a.y) * dy) / squared, 0.02, 0.98);
+  const projected = pointOnSegment(points, index, offset);
+  return { wallIndex: index, wallOffset: offset, point: projected, distance: Math.hypot(point.x - projected.x, point.y - projected.y), wallLength: Math.sqrt(squared) };
+}
+function nearestWallProjection(point: Point, points: Point[]) {
+  return points.reduce((best, _, index) => { const candidate = projectOnSegment(point, points, index); return !best || candidate.distance < best.distance ? candidate : best; }, null as ReturnType<typeof projectOnSegment> | null);
+}
 
 function lineIntersection(p: Point, r: Point, q: Point, s: Point) {
   const cross = r.x * s.y - r.y * s.x;
@@ -245,9 +255,16 @@ function automaticRoutes(fixtures: WallFixture[], existing: Point[], lining: Poi
   });
 }
 function effectiveRoutePoints(route: NetworkRoute, fixtures: WallFixture[], existing: Point[], lining: Point[]) {
-  const points = copyPoints(route.points); const source = fixtures.find((fixture) => fixture.id === route.sourceFixtureId); const target = fixtures.find((fixture) => fixture.id === route.targetFixtureId);
+  const points = copyPoints(route.points).map((point) => {
+    if (point.wallIndex === undefined) return point;
+    const walls = point.wallLayer === "existing" ? existing : lining;
+    const wallIndex = Math.min(point.wallIndex, walls.length - 1);
+    return { ...point, ...pointOnSegment(walls, wallIndex, point.wallOffset ?? 0.5) };
+  });
+  const source = fixtures.find((fixture) => fixture.id === route.sourceFixtureId); const target = fixtures.find((fixture) => fixture.id === route.targetFixtureId);
   if (source && points.length) points[0] = fixturePosition(source, existing, lining);
   if (target && points.length) points[points.length - 1] = fixturePosition(target, existing, lining);
+  if (route.id.startsWith("auto-") && points.length === 3 && !route.points.some((point) => point.wallIndex !== undefined)) points[1] = { x: points[0].x, y: points[2].y };
   return points;
 }
 function routeLength(route: NetworkRoute, fixtures: WallFixture[], existing: Point[], lining: Point[]) {
@@ -277,6 +294,7 @@ export default function Home() {
   const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
   const [selectedRouteId, setSelectedRouteId] = useState<string | null>(null);
   const [networkFilter, setNetworkFilter] = useState<NetworkKind>("electric");
+  const [routeWallWaypointMode, setRouteWallWaypointMode] = useState(false);
   const [orthogonalSnap, setOrthogonalSnap] = useState(true);
   const [elementSnap, setElementSnap] = useState(true);
   const [showDimensions, setShowDimensions] = useState(true);
@@ -293,12 +311,12 @@ export default function Home() {
   const layerPoints = selectedWall?.layer === "lining" ? lining : existing;
 
   const bounds = useMemo(() => {
-    const all = [...existing, ...lining, ...objects.flatMap((object) => [{ x: object.x, y: object.y }, { x: object.x + object.w, y: object.y + object.h }])];
+    const all = [...existing, ...lining, ...objects.flatMap((object) => [{ x: object.x, y: object.y }, { x: object.x + object.w, y: object.y + object.h }]), ...routes.flatMap((route) => effectiveRoutePoints(route, fixtures, existing, lining))];
     const finite = all.filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
     const minX = Math.min(0, ...finite.map((point) => point.x)); const minY = Math.min(0, ...finite.map((point) => point.y));
     const maxX = Math.max(600, ...finite.map((point) => point.x)); const maxY = Math.max(550, ...finite.map((point) => point.y)); const padding = 55;
     return { x: minX - padding, y: minY - padding, width: Math.max(710, maxX - minX + padding * 2), height: Math.max(660, maxY - minY + padding * 2) };
-  }, [existing, lining, objects]);
+  }, [existing, lining, objects, routes, fixtures]);
 
   const routeTotals = useMemo(() => ({
     electric: routes.filter((route) => route.kind === "electric").reduce((sum, route) => sum + routeLength(route, fixtures, existing, lining), 0),
@@ -373,6 +391,18 @@ export default function Home() {
   useEffect(() => { if (hydrated) localStorage.setItem(DRAFT_KEY, JSON.stringify({ projectName, existing, lining, fixtures, objects, routes, build, budgetChoices, elementSnap, showPrices })); }, [hydrated, projectName, existing, lining, fixtures, objects, routes, build, budgetChoices, elementSnap, showPrices]);
   useEffect(() => { if (hydrated) localStorage.setItem(PRODUCTS_KEY, JSON.stringify(products)); }, [hydrated, products]);
   useEffect(() => { if (hydrated) localStorage.setItem(SAVES_KEY, JSON.stringify(savedProjects)); }, [hydrated, savedProjects]);
+  useEffect(() => {
+    const root = document.documentElement; let frame = 0;
+    const followPointer = (event: globalThis.PointerEvent) => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        root.style.setProperty("--pointer-x", `${event.clientX}px`);
+        root.style.setProperty("--pointer-y", `${event.clientY}px`);
+      });
+    };
+    window.addEventListener("pointermove", followPointer, { passive: true });
+    return () => { cancelAnimationFrame(frame); window.removeEventListener("pointermove", followPointer); };
+  }, []);
 
   function pointFromEvent(event: { clientX: number; clientY: number }) {
     const svg = svgRef.current; const matrix = svg?.getScreenCTM(); if (!svg || !matrix) return null;
@@ -410,10 +440,11 @@ export default function Home() {
     const pointer = pointFromEvent(event); const drag = dragRef.current; if (!pointer || !drag) return;
     if (drag.type === "wall-point") setPoints(drag.layer, (points) => points.map((point, index) => index === drag.index ? snapPoint(pointer, points, index) : point));
     if (drag.type === "fixture") setFixtures((current) => current.map((fixture) => {
-      if (fixture.id !== drag.id) return fixture; const points = fixture.layer === "existing" ? existing : lining; const wall = segment(points, fixture.wallIndex); const dx = wall.b.x - wall.a.x; const dy = wall.b.y - wall.a.y; const squared = dx * dx + dy * dy || 1;
-      const wallLength = Math.sqrt(squared); let offset = clamp(((pointer.x - wall.a.x) * dx + (pointer.y - wall.a.y) * dy) / squared, 0.02, 0.98);
-      if (elementSnap) offset = clamp(Math.round(offset * wallLength / 5) * 5 / wallLength, 0.02, 0.98);
-      return { ...fixture, offset };
+      if (fixture.id !== drag.id) return fixture;
+      const points = fixture.layer === "existing" ? existing : lining; const nearest = nearestWallProjection(pointer, points); if (!nearest) return fixture;
+      let offset = nearest.wallOffset;
+      if (elementSnap) offset = clamp(Math.round(offset * nearest.wallLength / 5) * 5 / nearest.wallLength, 0.02, 0.98);
+      return { ...fixture, wallIndex: nearest.wallIndex, offset };
     }));
     if (drag.type === "object" || drag.type === "resize-object") setObjects((current) => current.map((object) => {
       if (object.id !== drag.id) return object; const dx = pointer.x - drag.start.x; const dy = pointer.y - drag.start.y;
@@ -421,7 +452,11 @@ export default function Home() {
       const width = Math.max(20, drag.origin.x + dx); const height = Math.max(20, drag.origin.y + dy);
       return { ...object, w: elementSnap ? Math.round(width / 5) * 5 : round(width), h: elementSnap ? Math.round(height / 5) * 5 : round(height) };
     }));
-    if (drag.type === "route-point") setRoutes((current) => current.map((route) => route.id === drag.routeId ? { ...route, points: route.points.map((point, index) => index === drag.pointIndex ? { x: Math.max(0, round(drag.origin.x + pointer.x - drag.start.x)), y: Math.max(0, round(drag.origin.y + pointer.y - drag.start.y)) } : point) } : route));
+    if (drag.type === "route-point") setRoutes((current) => current.map((route) => route.id === drag.routeId ? { ...route, points: route.points.map((point, index) => {
+      if (index !== drag.pointIndex) return point;
+      if (point.wallIndex !== undefined) { const nearest = nearestWallProjection(pointer, lining); return nearest ? { x: nearest.point.x, y: nearest.point.y, wallIndex: nearest.wallIndex, wallOffset: nearest.wallOffset, wallLayer: "lining" } : point; }
+      return { x: round(drag.origin.x + pointer.x - drag.start.x), y: round(drag.origin.y + pointer.y - drag.start.y) };
+    }) } : route));
   }
   function endDrag() { if (dragRef.current) setNotice("Modification enregistrée"); dragRef.current = null; }
 
@@ -457,15 +492,39 @@ export default function Home() {
 
   function addFreeRoute(kind: NetworkKind) { const source = fixtures.find((fixture) => fixtureSource(fixture.kind) === kind); const start = source ? fixturePosition(source, existing, lining) : { x: 40, y: 40 }; const end = { x: 300, y: 260 }; const route = { id: `route-${uid()}`, kind, name: `${networkName(kind)} libre`, sourceFixtureId: source?.id, points: [start, { x: start.x, y: end.y }, end] }; setRoutes((current) => [...current, route]); setSelectedRouteId(route.id); clearSelection("route"); }
   function addRoutePoint() { if (!selectedRoute) return; const points = effectiveRoutePoints(selectedRoute, fixtures, existing, lining); const index = Math.max(1, points.length - 1); const a = points[index - 1]; const b = points[index]; setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, points: [...route.points.slice(0, index), { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, ...route.points.slice(index)] } : route)); }
+  function addWallWaypoint(event: ReactPointerEvent<SVGLineElement>, wallIndex: number) {
+    if (!selectedRoute || !routeWallWaypointMode) return false;
+    const pointer = pointFromEvent(event); if (!pointer) return false; const projected = projectOnSegment(pointer, lining, wallIndex);
+    const waypoint: RoutePoint = { x: projected.point.x, y: projected.point.y, wallIndex, wallOffset: projected.wallOffset, wallLayer: "lining" };
+    setRoutes((current) => current.map((route) => {
+      if (route.id !== selectedRoute.id) return route;
+      const alreadyGuided = route.points.some((point) => point.wallIndex !== undefined);
+      if (route.id.startsWith("auto-") && !alreadyGuided) return { ...route, points: [route.points[0], waypoint, route.points[route.points.length - 1]] };
+      const insertAt = Math.max(1, route.points.length - 1);
+      return { ...route, points: [...route.points.slice(0, insertAt), waypoint, ...route.points.slice(insertAt)] };
+    }));
+    setRouteWallWaypointMode(false); setNotice(`Point de passage ajouté sur le mur BA13 ${wallIndex + 1}`); return true;
+  }
+  function removeLastWallWaypoint() {
+    if (!selectedRoute) return;
+    const lastIndex = selectedRoute.points.reduce((found, point, index) => point.wallIndex !== undefined && index > 0 && index < selectedRoute.points.length - 1 ? index : found, -1);
+    if (lastIndex < 0) { setNotice("Ce tracé n’a pas encore de passage mural"); return; }
+    setRoutes((current) => current.map((route) => {
+      if (route.id !== selectedRoute.id) return route; const points = route.points.filter((_, index) => index !== lastIndex);
+      if (route.id.startsWith("auto-") && points.length === 2) return { ...route, points: [points[0], { x: points[0].x, y: points[1].y }, points[1]] };
+      return { ...route, points };
+    }));
+    setNotice("Dernier point de passage retiré");
+  }
 
   function resetPlan() {
     if (!window.confirm("Créer un nouveau plan ? Le brouillon actuel sera remplacé, mais tes configurations sauvegardées et ta bibliothèque de produits resteront disponibles.")) return;
     const nextExisting = copyPoints(defaultExisting); const nextBuild = { ...defaultBuild }; const nextLining = createLining(nextExisting, nextBuild); const nextFixtures = copyFixtures(defaultFixtures);
     setProjectName("Nouveau projet"); setExisting(nextExisting); setBuild(nextBuild); setLining(nextLining); setFixtures(nextFixtures); setObjects(copyObjects(defaultObjects)); setRoutes(automaticRoutes(nextFixtures, nextExisting, nextLining)); setBudgetChoices({});
-    setElementSnap(true); setShowPrices(false); setMode("plan"); setSelectedWall({ layer: "existing", index: 0 }); setSelectedFixtureId(null); setSelectedObjectId(null); setSelectedRouteId(null); setNotice("Nouveau plan créé — les sauvegardes et produits sont conservés");
+    setElementSnap(true); setShowPrices(false); setMode("plan"); setSelectedWall({ layer: "existing", index: 0 }); setSelectedFixtureId(null); setSelectedObjectId(null); setSelectedRouteId(null); setRouteWallWaypointMode(false); setNotice("Nouveau plan créé — les sauvegardes et produits sont conservés");
   }
   function saveProject() { const name = projectName.trim() || "Projet sans nom"; const saved: SavedProject = { id: uid(), name, updatedAt: new Date().toISOString(), existing: copyPoints(existing), lining: copyPoints(lining), fixtures: copyFixtures(fixtures), objects: copyObjects(objects), routes: copyRoutes(routes), build: { ...build }, budgetChoices: { ...budgetChoices }, elementSnap, showPrices }; setSavedProjects((current) => [saved, ...current]); setNotice(`« ${name} » sauvegardé`); }
-  function loadProject(project: SavedProject) { setProjectName(project.name); setExisting(copyPoints(project.existing)); setLining(copyPoints(project.lining)); setFixtures(copyFixtures(project.fixtures)); setObjects(copyObjects(project.objects)); setRoutes(copyRoutes(project.routes)); setBuild({ ...defaultBuild, ...project.build }); setBudgetChoices({ ...project.budgetChoices }); setElementSnap(project.elementSnap ?? true); setShowPrices(project.showPrices ?? false); setNotice(`« ${project.name} » chargé`); }
+  function loadProject(project: SavedProject) { setProjectName(project.name); setExisting(copyPoints(project.existing)); setLining(copyPoints(project.lining)); setFixtures(copyFixtures(project.fixtures)); setObjects(copyObjects(project.objects)); setRoutes(copyRoutes(project.routes)); setBuild({ ...defaultBuild, ...project.build }); setBudgetChoices({ ...project.budgetChoices }); setElementSnap(project.elementSnap ?? true); setShowPrices(project.showPrices ?? false); setRouteWallWaypointMode(false); setNotice(`« ${project.name} » chargé`); }
 
   function addProduct() { if (!newProduct.name.trim()) return; setProducts((current) => [{ ...newProduct, id: uid() }, ...current]); setNewProduct((current) => ({ ...current, name: "", reference: "", price: 0 })); setNotice("Produit ajouté à la bibliothèque"); }
   function updateProduct(id: string, changes: Partial<Product>) { setProducts((current) => current.map((product) => product.id === id ? { ...product, ...changes } : product)); }
@@ -479,7 +538,7 @@ export default function Home() {
     <main className="app-shell">
       <header className="app-header">
         <div className="brand"><div className="brand-mark">AR</div><div><strong>Atelier Rénovation</strong><span>Plan · réseaux · matériaux</span></div></div>
-        <nav className="mode-nav" aria-label="Modes de travail">{([["plan", "Plan"], ["layout", "Aménagement"], ["networks", "Réseaux"], ["budget", "Budget"], ["products", "Produits"]] as [Mode, string][]).map(([value, label]) => <button type="button" key={value} className={mode === value ? "active" : ""} onClick={() => { setMode(value); clearSelection(); }}>{label}</button>)}</nav>
+        <nav className="mode-nav" aria-label="Modes de travail">{([["plan", "Plan"], ["layout", "Aménagement"], ["networks", "Réseaux"], ["budget", "Budget"], ["products", "Produits"]] as [Mode, string][]).map(([value, label]) => <button type="button" key={value} className={mode === value ? "active" : ""} onClick={() => { setMode(value); setRouteWallWaypointMode(false); clearSelection(); }}>{label}</button>)}</nav>
         <div className="project-actions"><input value={projectName} aria-label="Nom du projet" onChange={(event) => setProjectName(event.target.value)} /><button type="button" className="new-plan-button" onClick={resetPlan}>Nouveau plan</button><button type="button" className="save-button" onClick={saveProject}>Sauvegarder</button><details className="project-menu"><summary aria-label="Projets sauvegardés">{savedProjects.length}</summary><div><strong>Projets sauvegardés</strong>{savedProjects.length ? savedProjects.map((project) => <button type="button" key={project.id} onClick={() => loadProject(project)}><span>{project.name}</span><small>{new Date(project.updatedAt).toLocaleDateString("fr-FR")}</small></button>) : <p>Aucun projet nommé</p>}</div></details></div>
       </header>
 
@@ -493,14 +552,14 @@ export default function Home() {
           </div>
 
           <div className="drawing-stage">
-            <svg ref={svgRef} viewBox={`${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}`} role="img" aria-label="Plan interactif de rénovation" onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
+            <svg ref={svgRef} className={routeWallWaypointMode ? "waypoint-mode" : ""} viewBox={`${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}`} role="img" aria-label="Plan interactif de rénovation" onPointerMove={onPointerMove} onPointerUp={endDrag} onPointerLeave={endDrag} onPointerCancel={endDrag}>
               <defs><pattern id="cad-grid" width="10" height="10" patternUnits="userSpaceOnUse"><path d="M10 0H0V10" fill="none" /></pattern><filter id="soft-shadow"><feDropShadow dx="0" dy="3" stdDeviation="3" floodOpacity=".16" /></filter></defs>
               <rect x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} className="canvas-bg" onPointerDown={() => clearSelection()} />
               <rect x={bounds.x} y={bounds.y} width={bounds.width} height={bounds.height} fill="url(#cad-grid)" pointerEvents="none" />
               <path d={wallPath(existing)} className="room-fill" pointerEvents="none" />
 
               {existing.map((_, index) => { const wall = segment(existing, index); const selected = selectedWall?.layer === "existing" && selectedWall.index === index; return <g key={`existing-${index}`}><line className="wall-hit" x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedWall({ layer: "existing", index }); clearSelection("wall"); }} /><line className={`wall-line existing-wall ${selected ? "selected" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" />{showDimensions && <g className="wall-dimension" transform={`translate(${(wall.a.x + wall.b.x) / 2},${(wall.a.y + wall.b.y) / 2})`}><rect x="-23" y="-9" width="46" height="18" rx="8" /><text textAnchor="middle" dominantBaseline="middle">{Math.round(segmentLength(existing, index))} cm</text></g>}</g>; })}
-              {lining.map((_, index) => { const wall = segment(lining, index); const selected = selectedWall?.layer === "lining" && selectedWall.index === index; return <g key={`lining-${index}`}><line className="wall-hit" x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedWall({ layer: "lining", index }); clearSelection("wall"); }} /><line className={`wall-line lining-wall ${selected ? "selected" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" /></g>; })}
+              {lining.map((_, index) => { const wall = segment(lining, index); const selected = selectedWall?.layer === "lining" && selectedWall.index === index; return <g key={`lining-${index}`}><line className={`wall-hit ${routeWallWaypointMode ? "waypoint-target" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); if (mode === "networks" && addWallWaypoint(event, index)) return; setSelectedWall({ layer: "lining", index }); clearSelection("wall"); }} /><line className={`wall-line lining-wall ${selected ? "selected" : ""} ${routeWallWaypointMode ? "waypoint-ready" : ""}`} x1={wall.a.x} y1={wall.a.y} x2={wall.b.x} y2={wall.b.y} pointerEvents="none" /></g>; })}
 
               {mode === "plan" && (selectedWall?.layer === "existing" ? existing : lining).map((point, index) => <circle key={`vertex-${index}`} className={`wall-vertex ${selectedWall?.layer === "lining" ? "lining-vertex" : ""}`} cx={point.x} cy={point.y} r="6" onPointerDown={(event) => beginPointDrag(event, selectedWall?.layer ?? "existing", index)} />)}
 
@@ -511,19 +570,37 @@ export default function Home() {
 
               {mode !== "plan" && objects.map((object) => { const selected = selectedObjectId === object.id; return <g key={object.id} className={`plan-object ${mode === "networks" ? "ghost" : ""} ${selected ? "selected" : ""}`} role="button" tabIndex={0} aria-label={object.name} onPointerDown={(event) => beginObjectDrag(event, object, "object")}><rect x={object.x} y={object.y} width={object.w} height={object.h} rx="3" fill={objectMeta[object.kind].color} /><text x={object.x + object.w / 2} y={object.y + object.h / 2} textAnchor="middle" dominantBaseline="middle">{object.name}</text>{mode === "layout" && <text className="object-size" x={object.x + object.w / 2} y={object.y + object.h / 2 + 14} textAnchor="middle">{Math.round(object.w)} × {Math.round(object.h)}</text>}{showPrices && object.showPrice !== false && (object.unitPrice ?? 0) > 0 && <g className="price-tag" transform={`translate(${object.x + object.w / 2},${object.y + object.h + 12})`}><rect x="-27" y="-8" width="54" height="16" rx="7" /><text textAnchor="middle" dominantBaseline="middle">{euros(object.unitPrice ?? 0)}</text></g>}{selected && mode === "layout" && <rect className="resize-handle" x={object.x + object.w - 7} y={object.y + object.h - 7} width="14" height="14" rx="3" onPointerDown={(event) => beginObjectDrag(event, object, "resize-object")} />}</g>; })}
 
-              {mode === "networks" && routes.filter((route) => route.kind === networkFilter).map((route) => <g key={route.id} className={`network-route route-${route.kind} ${selectedRouteId === route.id ? "selected" : ""}`}><path className="route-hit" d={routePath(route)} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedRouteId(route.id); clearSelection("route"); }} /><path d={routePath(route)} pointerEvents="none" /></g>)}
-              {mode === "networks" && selectedRoute && selectedRoute.kind === networkFilter && <g className={`route-handles handles-${selectedRoute.kind}`}>{effectiveRoutePoints(selectedRoute, fixtures, existing, lining).map((point, index) => { const anchored = index === 0 && selectedRoute.sourceFixtureId || index === selectedRoute.points.length - 1 && selectedRoute.targetFixtureId; return <circle key={index} cx={point.x} cy={point.y} r={anchored ? 4 : 7} className={anchored ? "anchored" : "movable"} onPointerDown={(event) => { if (anchored) return; const start = pointFromEvent(event); if (!start) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "route-point", routeId: selectedRoute.id, pointIndex: index, start, origin: point }; }} />; })}</g>}
+              {mode === "networks" && routes.filter((route) => route.kind === networkFilter).map((route) => <g key={route.id} className={`network-route route-${route.kind} ${selectedRouteId === route.id ? "selected" : ""}`}><path className="route-hit" d={routePath(route)} onPointerDown={(event) => { event.preventDefault(); event.stopPropagation(); setSelectedRouteId(route.id); setRouteWallWaypointMode(false); clearSelection("route"); }} /><path d={routePath(route)} pointerEvents="none" /></g>)}
+              {mode === "networks" && selectedRoute && selectedRoute.kind === networkFilter && <g className={`route-handles handles-${selectedRoute.kind}`}>{effectiveRoutePoints(selectedRoute, fixtures, existing, lining).map((point, index) => { const terminal = Boolean(index === 0 && selectedRoute.sourceFixtureId || index === selectedRoute.points.length - 1 && selectedRoute.targetFixtureId); const wallWaypoint = selectedRoute.points[index]?.wallIndex !== undefined; return <circle key={index} cx={point.x} cy={point.y} r={terminal ? 4 : wallWaypoint ? 8 : 7} className={terminal ? "anchored" : wallWaypoint ? "wall-waypoint" : "movable"} onPointerDown={(event) => { if (terminal) return; const start = pointFromEvent(event); if (!start) return; event.preventDefault(); event.stopPropagation(); event.currentTarget.setPointerCapture(event.pointerId); dragRef.current = { type: "route-point", routeId: selectedRoute.id, pointIndex: index, start, origin: point }; }} />; })}</g>}
             </svg>
           </div>
           <div className="canvas-footer"><span><b>{existing.length}</b> angles du bâti</span><span><b>{metrics.existingPerimeter.toFixed(1)} m</b> de murs existants</span><span><b>{metrics.liningPerimeter.toFixed(1)} m</b> de doublage</span><span><b>{metrics.openingArea.toFixed(1)} m²</b> d’ouvertures déduites</span></div>
         </div>
 
         <aside className="inspector-panel">
-          {mode === "plan" && <div className="inspector-content"><div className="panel-title"><span>01 · Structure</span><h2>Murs et doublages</h2><p>Dessine la forme réelle, y compris les biais et les décrochements.</p></div><div className="layer-switch"><button type="button" className={selectedWall?.layer !== "lining" ? "active" : ""} onClick={() => { setSelectedWall({ layer: "existing", index: 0 }); clearSelection("wall"); }}>Murs existants</button><button type="button" className={selectedWall?.layer === "lining" ? "active" : ""} onClick={() => { setSelectedWall({ layer: "lining", index: 0 }); clearSelection("wall"); }}>Doublage BA13</button></div>{selectedWall ? <><div className="selection-card"><span className="selection-label">{selectedWall.layer === "existing" ? "Mur existant" : "Doublage BA13"} · segment {selectedWall.index + 1}</span><div className="field-grid"><NumberInput label="Longueur" value={segmentLength(layerPoints, selectedWall.index)} min={10} onChange={updateSelectedWallLength} /><NumberInput label="Angle" value={segmentAngle(layerPoints, selectedWall.index)} unit="°" min={-180} max={180} onChange={updateSelectedWallAngle} /></div><div className="tool-grid"><button type="button" onClick={() => alignWall("horizontal")}>Aligner horizontal</button><button type="button" onClick={() => alignWall("vertical")}>Aligner vertical</button><button type="button" onClick={addWallPoint}>＋ Point intermédiaire</button><button type="button" onClick={addRecess}>＋ Décroché</button><button type="button" className="danger" disabled={layerPoints.length <= 3} onClick={deleteWallPoint}>Supprimer le point suivant</button></div></div>{selectedWall.layer === "existing" && <div className="lining-card"><div><span>Retrait du doublage</span><strong>{build.liningDepth} cm</strong></div><input type="range" min="3" max="30" value={build.liningDepth} onChange={(event) => setBuild((current) => ({ ...current, liningDepth: Number(event.target.value) }))} /><label className="lining-toggle"><input type="checkbox" checked={build.autoSquareLining} onChange={(event) => setBuild((current) => ({ ...current, autoSquareLining: event.target.checked }))} /><span>Redresser les petits écarts pour les rails</span></label><label className="lining-tolerance"><span>Tolérance angulaire</span><div><input type="number" min="0" max="30" step="1" value={build.rightAngleTolerance} disabled={!build.autoSquareLining} onChange={(event) => setBuild((current) => ({ ...current, rightAngleTolerance: Math.max(0, Math.min(30, event.currentTarget.valueAsNumber || 0)) }))} /><small>°</small></div></label><div className="lining-result"><span>Correction détectée</span><strong>{build.autoSquareLining ? `${correctedWallCount} mur${correctedWallCount > 1 ? "s" : ""}` : "désactivée"}</strong></div><button type="button" onClick={regenerateLining}>Recalculer les rails + le BA13</button><p>Écart inférieur ou égal à {build.rightAngleTolerance}° : le doublage est remis à l’équerre. Au-delà, il suit le biais réel du mur existant.</p></div>}</> : <div className="empty-selection"><span>↖</span><strong>Sélectionne un mur</strong><p>Les cotes se modifient directement dans ce panneau.</p></div>}<div className="fixture-tools"><div><span>Éléments intégrés aux murs</span><small>Ils glissent uniquement le long du mur sélectionné.</small></div><button type="button" onClick={() => addFixture("door")}>＋ Porte</button><button type="button" onClick={() => addFixture("window")}>＋ Fenêtre</button></div>{selectedFixture && fixtureMeta[selectedFixture.kind].opening && <FixtureInspector fixture={selectedFixture} onChange={updateFixture} onDelete={deleteFixture} />}</div>}
+          {mode === "plan" && (
+            <div className="inspector-content">
+              <div className="panel-title"><span>01 · Structure</span><h2>Murs et doublages</h2><p>Dessine la forme réelle, y compris les biais et les décrochements.</p></div>
+              <div className="layer-switch"><button type="button" className={selectedWall?.layer !== "lining" ? "active" : ""} onClick={() => { setSelectedWall({ layer: "existing", index: 0 }); clearSelection("wall"); }}>Murs existants</button><button type="button" className={selectedWall?.layer === "lining" ? "active" : ""} onClick={() => { setSelectedWall({ layer: "lining", index: 0 }); clearSelection("wall"); }}>Doublage BA13</button></div>
+              {selectedWall ? <><div className="selection-card"><span className="selection-label">{selectedWall.layer === "existing" ? "Mur existant" : "Doublage BA13"} · segment {selectedWall.index + 1}</span><div className="field-grid"><NumberInput label="Longueur" value={segmentLength(layerPoints, selectedWall.index)} min={10} onChange={updateSelectedWallLength} /><NumberInput label="Angle" value={segmentAngle(layerPoints, selectedWall.index)} unit="°" min={-180} max={180} onChange={updateSelectedWallAngle} /></div><div className="tool-grid"><button type="button" onClick={() => alignWall("horizontal")}>Aligner horizontal</button><button type="button" onClick={() => alignWall("vertical")}>Aligner vertical</button><button type="button" onClick={addWallPoint}>＋ Point intermédiaire</button><button type="button" onClick={addRecess}>＋ Décroché</button><button type="button" className="danger" disabled={layerPoints.length <= 3} onClick={deleteWallPoint}>Supprimer le point suivant</button></div></div>
+              {selectedWall.layer === "existing" && <div className="lining-card"><div><span>Retrait du doublage</span><strong>{build.liningDepth} cm</strong></div><input type="range" min="3" max="30" value={build.liningDepth} onChange={(event) => { const liningDepth = Number(event.currentTarget.value); setBuild((current) => ({ ...current, liningDepth })); }} /><label className="lining-toggle"><input type="checkbox" checked={build.autoSquareLining} onChange={(event) => { const autoSquareLining = event.currentTarget.checked; setBuild((current) => ({ ...current, autoSquareLining })); }} /><span>Redresser les petits écarts pour les rails</span></label><NumberInput label="Tolérance angulaire" value={build.rightAngleTolerance} unit="°" min={0} max={30} onChange={(rightAngleTolerance) => setBuild((current) => ({ ...current, rightAngleTolerance }))} /><div className="lining-result"><span>Correction détectée</span><strong>{build.autoSquareLining ? `${correctedWallCount} mur${correctedWallCount > 1 ? "s" : ""}` : "désactivée"}</strong></div><button type="button" onClick={regenerateLining}>Recalculer les rails + le BA13</button><p>Écart inférieur ou égal à {build.rightAngleTolerance}° : le doublage est remis à l’équerre. Au-delà, il suit le biais réel du mur existant.</p></div>}</> : <div className="empty-selection"><span>↖</span><strong>Sélectionne un mur</strong><p>Les cotes se modifient directement dans ce panneau.</p></div>}
+              <div className="fixture-tools"><div><span>Éléments intégrés aux murs</span><small>Ils glissent sur n’importe quel mur compatible.</small></div><button type="button" onClick={() => addFixture("door")}>＋ Porte</button><button type="button" onClick={() => addFixture("window")}>＋ Fenêtre</button></div>
+              {selectedFixture && fixtureMeta[selectedFixture.kind].opening && <FixtureInspector fixture={selectedFixture} onChange={updateFixture} onDelete={deleteFixture} />}
+            </div>
+          )}
 
           {mode === "layout" && <div className="inspector-content"><div className="panel-title"><span>02 · Aménagement</span><h2>Volumes dans la pièce</h2><p>Les murs techniques restent discrets pour laisser la priorité à l’agencement.</p></div><div className="object-catalog">{(Object.keys(objectMeta) as ObjectKind[]).map((kind) => <button type="button" key={kind} onClick={() => addObject(kind)}><i style={{ background: objectMeta[kind].color }} /><span>{objectMeta[kind].label}</span><b>＋</b></button>)}</div>{selectedObject ? <div className="selection-card"><span className="selection-label">Objet sélectionné</span><input className="name-field" value={selectedObject.name} onChange={(event) => updateObject({ name: event.target.value })} /><div className="field-grid"><NumberInput label="Position X" value={selectedObject.x} onChange={(x) => updateObject({ x })} /><NumberInput label="Position Y" value={selectedObject.y} onChange={(y) => updateObject({ y })} /><NumberInput label="Largeur" value={selectedObject.w} min={20} onChange={(w) => updateObject({ w })} /><NumberInput label="Profondeur" value={selectedObject.h} min={20} onChange={(h) => updateObject({ h })} /><NumberInput label="Prix de l’élément" value={selectedObject.unitPrice ?? 0} unit="€" step={0.1} onChange={(unitPrice) => updateObject({ unitPrice })} /></div><label className="display-price-toggle"><input type="checkbox" checked={selectedObject.showPrice !== false} onChange={(event) => updateObject({ showPrice: event.target.checked })} /> Afficher ce prix sur le plan</label><div className="tool-grid"><button type="button" onClick={() => updateObject({ w: selectedObject.h, h: selectedObject.w })}>Pivoter 90°</button><button type="button" className="danger" onClick={() => { setObjects((current) => current.filter((object) => object.id !== selectedObject.id)); setSelectedObjectId(null); }}>Supprimer</button></div></div> : <div className="empty-selection compact"><span>↖</span><strong>Choisis ou sélectionne un volume</strong></div>}</div>}
 
-          {mode === "networks" && <div className="inspector-content"><div className="panel-title"><span>03 · Technique</span><h2>Un réseau à la fois</h2><p>Les points sont attachés aux murs ; les coudes restent déplaçables librement.</p></div><div className="network-switch">{(["electric", "cold", "hot"] as NetworkKind[]).map((kind) => <button type="button" key={kind} className={networkFilter === kind ? "active" : ""} onClick={() => { setNetworkFilter(kind); setSelectedRouteId(null); }}>{networkName(kind)}<strong>{routeTotals[kind].toFixed(1)} m</strong></button>)}</div><div className="network-actions">{networkFilter === "electric" ? <><button type="button" onClick={() => addFixture("source-electric")}>＋ Tableau</button><button type="button" onClick={() => addFixture("outlet")}>＋ Prise</button><button type="button" onClick={() => addFixture("switch")}>＋ Interrupteur</button><button type="button" onClick={() => addFixture("light")}>＋ Éclairage</button></> : networkFilter === "cold" ? <><button type="button" onClick={() => addFixture("source-cold")}>＋ Arrivée EF</button><button type="button" onClick={() => addFixture("water-cold")}>＋ Sortie EF</button></> : <><button type="button" onClick={() => addFixture("source-hot")}>＋ Départ EC</button><button type="button" onClick={() => addFixture("water-hot")}>＋ Sortie EC</button></>}<button type="button" className="wide" onClick={() => addFreeRoute(networkFilter)}>＋ Tracé libre vers une autre pièce</button></div>{selectedFixture && !fixtureMeta[selectedFixture.kind].opening && <FixtureInspector fixture={selectedFixture} onChange={updateFixture} onDelete={deleteFixture} />}{selectedRoute && <div className="selection-card route-card"><span className="selection-label">Tracé sélectionné</span><input className="name-field" value={selectedRoute.name} onChange={(event) => setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, name: event.target.value } : route))} /><p><strong>{routeLength(selectedRoute, fixtures, existing, lining).toFixed(2)} m</strong> avec marge de 15 %</p><div className="tool-grid"><button type="button" onClick={addRoutePoint}>＋ Ajouter un coude</button><button type="button" className="danger" onClick={() => { setRoutes((current) => current.filter((route) => route.id !== selectedRoute.id)); setSelectedRouteId(null); }}>Supprimer</button></div></div>}<div className="route-list">{routes.filter((route) => route.kind === networkFilter).map((route) => <button type="button" key={route.id} className={selectedRouteId === route.id ? "active" : ""} onClick={() => { setSelectedRouteId(route.id); clearSelection("route"); }}><span>{route.name}</span><strong>{routeLength(route, fixtures, existing, lining).toFixed(1)} m</strong></button>)}</div></div>}
+          {mode === "networks" && (
+            <div className="inspector-content">
+              <div className="panel-title"><span>03 · Technique</span><h2>Routage guidé</h2><p>Déplace chaque équipement sur n’importe quel mur BA13, puis impose le trajet avec des points de passage.</p></div>
+              <div className="network-switch">{(["electric", "cold", "hot"] as NetworkKind[]).map((kind) => <button type="button" key={kind} className={networkFilter === kind ? "active" : ""} onClick={() => { setNetworkFilter(kind); setSelectedRouteId(null); setRouteWallWaypointMode(false); }}>{networkName(kind)}<strong>{routeTotals[kind].toFixed(1)} m</strong></button>)}</div>
+              <div className="network-actions">{networkFilter === "electric" ? <><button type="button" onClick={() => addFixture("source-electric")}>＋ Tableau</button><button type="button" onClick={() => addFixture("outlet")}>＋ Prise</button><button type="button" onClick={() => addFixture("switch")}>＋ Interrupteur</button><button type="button" onClick={() => addFixture("light")}>＋ Éclairage</button></> : networkFilter === "cold" ? <><button type="button" onClick={() => addFixture("source-cold")}>＋ Arrivée EF</button><button type="button" onClick={() => addFixture("water-cold")}>＋ Sortie EF</button></> : <><button type="button" onClick={() => addFixture("source-hot")}>＋ Départ EC</button><button type="button" onClick={() => addFixture("water-hot")}>＋ Sortie EC</button></>}<button type="button" className="wide" onClick={() => addFreeRoute(networkFilter)}>＋ Tracé libre vers une autre pièce</button></div>
+              {selectedFixture && !fixtureMeta[selectedFixture.kind].opening && <><div className="fixture-move-hint">Glisse ce point vers le mur BA13 de ton choix : il changera automatiquement de paroi.</div><FixtureInspector fixture={selectedFixture} onChange={updateFixture} onDelete={deleteFixture} /></>}
+              {selectedRoute && <div className="selection-card route-card"><span className="selection-label">Tracé sélectionné</span><input className="name-field" value={selectedRoute.name} onChange={(event) => { const name = event.currentTarget.value; setRoutes((current) => current.map((route) => route.id === selectedRoute.id ? { ...route, name } : route)); }} /><p><strong>{routeLength(selectedRoute, fixtures, existing, lining).toFixed(2)} m</strong> avec marge de 15 % · {selectedRoute.points.filter((point) => point.wallIndex !== undefined).length} passage(s) mural(aux)</p><div className="tool-grid route-tools"><button type="button" onClick={addRoutePoint}>＋ Coude libre</button><button type="button" className={routeWallWaypointMode ? "active" : ""} onClick={() => { setRouteWallWaypointMode((current) => !current); setNotice(routeWallWaypointMode ? "Ajout de passage annulé" : "Clique maintenant sur le mur BA13 à emprunter"); }}>＋ Passage mural</button><button type="button" onClick={removeLastWallWaypoint}>Retirer le dernier passage</button><button type="button" className="danger" onClick={() => { setRoutes((current) => current.filter((route) => route.id !== selectedRoute.id)); setSelectedRouteId(null); setRouteWallWaypointMode(false); }}>Supprimer le tracé</button></div>{routeWallWaypointMode && <div className="route-map-hint"><span>1</span><div><strong>Choisis le prochain passage</strong><small>Clique directement sur le mur BA13 voulu dans le plan.</small></div></div>}</div>}
+              <div className="route-list">{routes.filter((route) => route.kind === networkFilter).map((route) => <button type="button" key={route.id} className={selectedRouteId === route.id ? "active" : ""} onClick={() => { setSelectedRouteId(route.id); setRouteWallWaypointMode(false); clearSelection("route"); }}><span>{route.name}</span><strong>{routeLength(route, fixtures, existing, lining).toFixed(1)} m</strong></button>)}</div>
+            </div>
+          )}
 
           {mode === "budget" && (
             <div className="inspector-content budget-content">
@@ -558,7 +635,14 @@ export default function Home() {
             </div>
           )}
 
-          {mode === "products" && <div className="inspector-content product-content"><div className="panel-title"><span>05 · Bibliothèque</span><h2>Produits & conditionnements</h2><p>Catalogue personnel réutilisable dans tous les projets. Les prix restent datés et modifiables.</p></div><div className="import-actions"><button type="button" onClick={() => fileRef.current?.click()}>Importer un CSV</button><input ref={fileRef} hidden type="file" accept=".csv,text/csv" onChange={importProducts} /><small>Colonnes : nom; référence; catégorie; magasin; prix; couverture; unité; conditionnement; URL</small></div><details className="add-product" open><summary>Ajouter un produit</summary><input placeholder="Nom du produit" value={newProduct.name} onChange={(event) => setNewProduct((current) => ({ ...current, name: event.target.value }))} /><div className="field-grid"><label><span>Catégorie</span><select value={newProduct.category} onChange={(event) => setNewProduct((current) => ({ ...current, category: event.target.value as ProductCategory }))}>{(["plomberie", "electricite", "ossature", "isolation", "plaques", "carrelage", "consommables"] as ProductCategory[]).map((category) => <option key={category} value={category}>{category}</option>)}</select></label><label><span>Magasin</span><input value={newProduct.store} onChange={(event) => setNewProduct((current) => ({ ...current, store: event.target.value }))} /></label><NumberInput label="Prix du conditionnement" value={newProduct.price} unit="€" step={0.1} onChange={(price) => setNewProduct((current) => ({ ...current, price }))} /><NumberInput label="Couverture" value={newProduct.coverage} unit={newProduct.coverageUnit} step={0.1} onChange={(coverage) => setNewProduct((current) => ({ ...current, coverage }))} /></div><input placeholder="Référence / EAN" value={newProduct.reference} onChange={(event) => setNewProduct((current) => ({ ...current, reference: event.target.value }))} /><input placeholder="Lien vers la fiche produit" value={newProduct.url} onChange={(event) => setNewProduct((current) => ({ ...current, url: event.target.value }))} /><button type="button" className="primary" onClick={addProduct}>Ajouter à la bibliothèque</button></details><div className="product-list">{products.map((product) => <article key={product.id}><div className="product-head"><div><span>{product.store || "Sans magasin"}</span><strong>{product.name}</strong><small>{product.reference || "Sans référence"}</small></div>{product.url && <a href={product.url} target="_blank" rel="noreferrer">Fiche ↗</a>}</div><div className="product-fields"><NumberInput label="Prix" value={product.price} unit="€" step={0.1} onChange={(price) => updateProduct(product.id, { price, checkedAt: new Date().toISOString().slice(0, 10) })} /><NumberInput label={`Couverture / ${product.packLabel}`} value={product.coverage} unit={product.coverageUnit} step={0.1} onChange={(coverage) => updateProduct(product.id, { coverage })} /></div><footer><span>{product.category}</span><small>Prix vérifié le {formatDate(product.checkedAt)}</small><button type="button" onClick={() => setProducts((current) => current.filter((entry) => entry.id !== product.id))}>Supprimer</button></footer></article>)}</div></div>}
+          {mode === "products" && (
+            <div className="inspector-content product-content">
+              <div className="panel-title"><span>05 · Bibliothèque</span><h2>Produits & conditionnements</h2><p>Catalogue personnel réutilisable dans tous les projets. Les prix restent datés et modifiables.</p></div>
+              <div className="import-actions"><button type="button" onClick={() => fileRef.current?.click()}>Importer un CSV</button><input ref={fileRef} hidden type="file" accept=".csv,text/csv" onChange={importProducts} /><small>Colonnes : nom; référence; catégorie; magasin; prix; couverture; unité; conditionnement; URL</small></div>
+              <details className="add-product" open><summary>Ajouter un produit</summary><input placeholder="Nom du produit" value={newProduct.name} onChange={(event) => { const name = event.currentTarget.value; setNewProduct((current) => ({ ...current, name })); }} /><div className="field-grid"><label><span>Catégorie</span><select value={newProduct.category} onChange={(event) => { const category = event.currentTarget.value as ProductCategory; setNewProduct((current) => ({ ...current, category })); }}>{(["plomberie", "electricite", "ossature", "isolation", "plaques", "carrelage", "consommables"] as ProductCategory[]).map((category) => <option key={category} value={category}>{category}</option>)}</select></label><label><span>Magasin</span><input value={newProduct.store} onChange={(event) => { const store = event.currentTarget.value; setNewProduct((current) => ({ ...current, store })); }} /></label><NumberInput label="Prix du conditionnement" value={newProduct.price} unit="€" step={0.1} onChange={(price) => setNewProduct((current) => ({ ...current, price }))} /><NumberInput label="Couverture" value={newProduct.coverage} unit={newProduct.coverageUnit} step={0.1} onChange={(coverage) => setNewProduct((current) => ({ ...current, coverage }))} /></div><input placeholder="Référence / EAN" value={newProduct.reference} onChange={(event) => { const reference = event.currentTarget.value; setNewProduct((current) => ({ ...current, reference })); }} /><input placeholder="Lien vers la fiche produit" value={newProduct.url} onChange={(event) => { const url = event.currentTarget.value; setNewProduct((current) => ({ ...current, url })); }} /><button type="button" className="primary" onClick={addProduct}>Ajouter à la bibliothèque</button></details>
+              <div className="product-list">{products.map((product) => <article key={product.id}><div className="product-head"><div><span>{product.store || "Sans magasin"}</span><strong>{product.name}</strong><small>{product.reference || "Sans référence"}</small></div>{product.url && <a href={product.url} target="_blank" rel="noreferrer">Fiche ↗</a>}</div><div className="product-fields"><NumberInput label="Prix" value={product.price} unit="€" step={0.1} onChange={(price) => updateProduct(product.id, { price, checkedAt: new Date().toISOString().slice(0, 10) })} /><NumberInput label={`Couverture / ${product.packLabel}`} value={product.coverage} unit={product.coverageUnit} step={0.1} onChange={(coverage) => updateProduct(product.id, { coverage })} /></div><footer><span>{product.category}</span><small>Prix vérifié le {formatDate(product.checkedAt)}</small><button type="button" onClick={() => setProducts((current) => current.filter((entry) => entry.id !== product.id))}>Supprimer</button></footer></article>)}</div>
+            </div>
+          )}
         </aside>
       </section>
     </main>
